@@ -1,5 +1,6 @@
-// FIFA 16 launcher: the window's state. Play runs ~/fifa_metal/run.sh (GameControl.launch); Stop
-// stops only the emulator this launcher started (state.json); everything else is read-only.
+// FIFA 16 launcher: the window's state. Play runs the bundled run.sh (GameControl.launch) with
+// the four folders the user chose; Stop stops only the emulator this launcher started
+// (state.json); everything else is read-only.
 import AppKit
 import Foundation
 
@@ -7,18 +8,15 @@ import Foundation
 final class LauncherModel: ObservableObject {
     enum Phase: Equatable { case idle, starting, running, stopping }
 
-    let home = URL(fileURLWithPath: NSHomeDirectory())
-    private(set) var paths: Paths
+    let paths: Paths
     @Published var settings: LauncherSettings {
         didSet {
             guard settings != oldValue else { return }
             try? settings.save(to: paths.settingsFile)
-            if settings.runScript != oldValue.runScript { reloadPaths() }
+            refreshStatus()
         }
     }
     @Published private(set) var status: [StatusItem] = []
-    @Published private(set) var overlays: [String] = []
-    @Published private(set) var currentOverlay: String?
     @Published private(set) var phase = Phase.idle
     @Published private(set) var game: LaunchState?
     @Published private(set) var others: [EmulatorProcess] = []
@@ -35,12 +33,9 @@ final class LauncherModel: ObservableObject {
     private var refreshing = false
     private var tick = 0
 
-    init() {
-        let home = URL(fileURLWithPath: NSHomeDirectory())
-        let probe = Paths(home: home)
-        let settings = LauncherSettings.load(from: probe.settingsFile)
-        self.settings = settings
-        paths = Paths(home: home, runScript: settings.runScript.map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) })
+    init(paths: Paths = .live()) {
+        self.paths = paths
+        settings = LauncherSettings.load(from: paths.settingsFile)
         if let state = LaunchState.load(paths.stateFile), Processes.isAlive(state.pid), Processes.name(of: state.pid) == "shadps4" {
             game = state
             phase = .running
@@ -54,29 +49,24 @@ final class LauncherModel: ObservableObject {
         }
     }
 
-    private func reloadPaths() {
-        paths = Paths(home: home, runScript: settings.runScript.map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) })
-        refreshStatus()
-    }
-
+    var folders: GameFolders { GameFolders(settings: settings, paths: paths) }
     var running: Bool { phase != .idle }
     var problems: [StatusItem] { InstallStatus.problems(status) }
     var canPlay: Bool { phase == .idle && problems.isEmpty }
+    var firstLaunch: Bool { settings.gameDir.trimmingCharacters(in: .whitespaces).isEmpty }
     var playHelp: String {
-        if let p = problems.first { return "\(p.title) not found: \(p.detail)" }
-        return "Runs bash \(paths.runScript.path.replacingOccurrences(of: home.path, with: "~")) \(settings.mode.rawValue)"
+        if let p = problems.first { return "\(p.title): \(p.detail)" }
+        return "Runs the bundled run.sh \(settings.mode.rawValue) with the folders above"
     }
     /// The run folder shown (this launcher's game, else the newest run).
     var runFolder: URL? { game.map { URL(fileURLWithPath: $0.runDir) } ?? paths.latestRun() }
     var commandLine: String {
         let env = settings.overrides.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value) " }.joined()
-        return env + "bash " + paths.runScript.path.replacingOccurrences(of: home.path, with: "~") + " " + settings.mode.rawValue
+        return env + "bash \"FIFA 16.app/Contents/Resources/run.sh\" " + settings.mode.rawValue
     }
 
     func refreshStatus() {
-        status = InstallStatus.check(paths)
-        overlays = Overlay.choices(paths)
-        currentOverlay = Overlay.current(paths)
+        status = InstallStatus.check(paths, settings: settings)
     }
 
     /// Process list and log tail, off the main thread.
@@ -122,7 +112,7 @@ final class LauncherModel: ObservableObject {
         if !foreign.isEmpty {
             let alert = NSAlert()
             alert.messageText = "Another shadPS4 is running"
-            alert.informativeText = "run.sh stops every running shadps4 (pkill -x shadps4) before it starts the game, as it does in Terminal. Running now: pid \(foreign.map { String($0.pid) }.joined(separator: ", "))."
+            alert.informativeText = "run.sh stops every running shadps4 before it starts the game. Running now: pid \(foreign.map { String($0.pid) }.joined(separator: ", "))."
             alert.addButton(withTitle: "Stop It and Play")
             alert.addButton(withTitle: "Cancel")
             alert.alertStyle = .warning
@@ -132,12 +122,12 @@ final class LauncherModel: ObservableObject {
         message = nil
         scriptOutput = "$ \(commandLine)\n"
         onStateChange?()
-        let settings = self.settings, paths = self.paths, home = self.home
+        let settings = self.settings, paths = self.paths
         Task.detached(priority: .userInitiated) {
             let base = LaunchEnvironment.base(inherited: ProcessInfo.processInfo.environment,
-                                              loginPath: LaunchEnvironment.loginPath(), home: home.path)
-            let env = settings.launchEnvironment(base: base)
-            let result = GameControl.launch(script: paths.runScript, mode: settings.mode, environment: env, home: home)
+                                              loginPath: LaunchEnvironment.loginPath(), home: NSHomeDirectory())
+            let env = settings.launchEnvironment(base: base, paths: paths)
+            let result = GameControl.launch(script: paths.runScript, mode: settings.mode, environment: env, directory: paths.dataDir)
             await MainActor.run { self.launched(result, mode: settings.mode) }
         }
     }
@@ -155,6 +145,7 @@ final class LauncherModel: ObservableObject {
             message = result.runDir == nil ? "run.sh did not start the game (status \(result.status))." : "The game exited early."
             page = .log
         }
+        refreshStatus()
         refresh()
         onStateChange?()
     }
@@ -187,54 +178,98 @@ final class LauncherModel: ObservableObject {
         return true
     }
 
-    // MARK: GPU host bundle
+    // MARK: Folders
 
-    /// No game may be using the host while its binaries are overwritten (ours or another run's).
-    var canRefreshHost: Bool { !running && others.isEmpty }
-
-    /// Runs `bash ~/fifa_metal/host_app/refresh.sh` (copies the built host into FIFA 16 GPU.app).
-    func refreshHost() {
-        guard canRefreshHost else { return }
-        let script = paths.hostRefreshScript
-        message = "Refreshing the GPU host…"
-        Task.detached(priority: .userInitiated) {
-            // Checked again right before copying: a run may have started meanwhile.
-            let busy = Processes.emulators()
-            let result = busy.isEmpty ? Shell.run(["/bin/bash", script.path]) : (status: Int32(-1), output: "an emulator is running")
-            await MainActor.run {
-                let text = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
-                self.message = result.status == 0 ? (text.isEmpty ? "GPU host refreshed." : text) : "Refresh failed: \(text)"
-                self.refreshStatus()
+    enum Folder: String, CaseIterable, Identifiable {
+        case game, update, mods, saves
+        var id: String { rawValue }
+        var title: String {
+            switch self {
+            case .game: return "Game folder"
+            case .update: return "Update folder"
+            case .mods: return "Mods folder"
+            case .saves: return "Savegame folder"
             }
+        }
+        var hint: String {
+            switch self {
+            case .game: return "The dumped CUSA02138 folder: eboot.bin and sce_sys/ inside. Required."
+            case .update: return "The dumped update 1.07 (CUSA02138-UPDATE). Optional: without it the 1.00 game runs."
+            case .mods: return "A patch or mods folder (what fifamod builds); the game sees it as /download0. Optional."
+            case .saves: return "Where savegames are kept. Default: the app's data folder."
+            }
+        }
+        var clearable: Bool { self == .update || self == .mods }
+    }
+
+    func folderPath(_ folder: Folder) -> String {
+        switch folder {
+        case .game: return settings.gameDir
+        case .update: return settings.updateDir
+        case .mods: return settings.modsDir
+        case .saves: return settings.savesDir.isEmpty ? paths.defaultSaves.path : settings.savesDir
         }
     }
 
-    // MARK: Overlay and folders
+    func folderIsSet(_ folder: Folder) -> Bool {
+        folder == .saves || !folderPath(folder).trimmingCharacters(in: .whitespaces).isEmpty
+    }
 
-    func selectOverlay(_ name: String) {
-        guard !running, name != currentOverlay else { return }
-        let alert = NSAlert()
-        alert.messageText = "Use the \(Overlay.label(name)) overlay?"
-        alert.informativeText = "Points \(paths.overlayLink.path.replacingOccurrences(of: home.path, with: "~")) at \(paths.overlayStore.appendingPathComponent(name).path.replacingOccurrences(of: home.path, with: "~")) (now: \(currentOverlay ?? "none")). This is the Metal build's patch overlay: it applies to every launch of that build, including run.sh in Terminal."
-        alert.addButton(withTitle: "Switch Overlay")
-        alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        do {
-            try Overlay.select(name, paths: paths)
-            message = "Overlay: \(Overlay.label(name))."
-        } catch {
-            message = "\(error)"
+    func setFolder(_ folder: Folder, _ path: String) {
+        switch folder {
+        case .game: settings.gameDir = path
+        case .update: settings.updateDir = path
+        case .mods: settings.modsDir = path
+        case .saves: settings.savesDir = path == paths.defaultSaves.path ? "" : path
         }
-        refreshStatus()
+    }
+
+    func chooseFolder(_ folder: Folder) {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = folder == .saves
+        panel.prompt = "Choose"
+        panel.message = folder.hint
+        let current = folderPath(folder)
+        if !current.isEmpty { panel.directoryURL = URL(fileURLWithPath: (current as NSString).expandingTildeInPath) }
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        setFolder(folder, url.path)
+        message = "\(folder.title): \(url.lastPathComponent)"
+    }
+
+    func clearFolder(_ folder: Folder) {
+        guard folder.clearable else { return }
+        setFolder(folder, "")
     }
 
     func openRunFolder() { if let dir = runFolder { NSWorkspace.shared.open(dir) } }
-    func openRuns() { NSWorkspace.shared.open(paths.runs) }
-    func openShaderCache() { NSWorkspace.shared.open(paths.shaderCache) }
+    func openRuns() {
+        try? FileManager.default.createDirectory(at: paths.runs, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(paths.runs)
+    }
+    func openSaves() {
+        try? FileManager.default.createDirectory(at: folders.saves, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(folders.saves)
+    }
+    func openMods() { if let mods = folders.mods { NSWorkspace.shared.open(mods) } }
+    func openShaderCache() {
+        try? FileManager.default.createDirectory(at: paths.shaderCache, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(paths.shaderCache)
+    }
     func revealLog() { if let logURL { NSWorkspace.shared.activateFileViewerSelecting([logURL]) } }
     func openSettingsFile() {
         if !FileManager.default.fileExists(atPath: paths.settingsFile.path) { try? settings.save(to: paths.settingsFile) }
         NSWorkspace.shared.activateFileViewerSelecting([paths.settingsFile])
     }
-    func resetSettings() { settings = LauncherSettings() }
+    /// Options back to run.sh's defaults; the folders stay.
+    func resetOptions() {
+        var s = settings
+        s.fullscreen = true; s.lowLatency = false; s.frameStats = false; s.metalHUD = false; s.mode = .play
+        settings = s
+    }
+    var optionsAreDefault: Bool {
+        settings.fullscreen && !settings.lowLatency && !settings.frameStats && !settings.metalHUD && settings.mode == .play
+    }
 }

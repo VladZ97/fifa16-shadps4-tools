@@ -1,5 +1,5 @@
 // FIFA 16.app's main executable: the launcher window, or with --cli a command line over the
-// same model code (status | env | play | stop), for scripts and the smoke test.
+// same model code (status | env | play | stop | set), for scripts and the smoke test.
 import AppKit
 import SwiftUI
 
@@ -60,16 +60,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 // MARK: --cli
 
 func cli(_ args: [String]) -> Int32 {
-    let home = URL(fileURLWithPath: NSHomeDirectory())
-    let probe = Paths(home: home)
-    let settings = LauncherSettings.load(from: probe.settingsFile)
-    let paths = Paths(home: home, runScript: settings.runScript.map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) })
-    let base = LaunchEnvironment.base(inherited: ProcessInfo.processInfo.environment,
-                                      loginPath: LaunchEnvironment.loginPath(), home: home.path)
-    let launch = settings.launchEnvironment(base: base)
+    let paths = Paths.live()
+    var settings = LauncherSettings.load(from: paths.settingsFile)
     switch args.first ?? "status" {
     case "status":
-        for item in InstallStatus.check(paths) {
+        for item in InstallStatus.check(paths, settings: settings) {
             print("\(item.ok ? "ok  " : (item.optional ? "warn" : "MISS")) \(item.title): \(item.detail)")
         }
         let state = LaunchState.load(paths.stateFile)
@@ -77,26 +72,39 @@ func cli(_ args: [String]) -> Int32 {
         for p in Processes.emulators() where p.pid != state?.pid { print("other emulator: \(p.pid) \(p.command)") }
         return 0
     case "env":
-        // The variables Play adds to run.sh's environment, then what the game process gets.
+        // The command Play runs and the variables it adds to the environment (folders and overrides).
         print("# command: \(GameControl.command(script: paths.runScript, mode: settings.mode).joined(separator: " "))")
-        print("# overrides: \(settings.overrides.isEmpty ? "none (run.sh defaults)" : settings.overrides.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: " "))")
-        let game = RunScript.gameEnvironment(launch: launch, home: home.path)
-        for key in game.keys.sorted() where launch[key] != game[key] || RunScript.exportedNames.contains(key) || LauncherSettings.ownedKeys.contains(key) {
-            print("\(key)=\(game[key]!)")
-        }
+        print("# options: \(settings.overrides.isEmpty ? "none (run.sh defaults)" : settings.overrides.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: " "))")
+        let added = settings.folderEnvironment(paths: paths).merging(settings.overrides) { _, new in new }
+        for key in added.keys.sorted() { print("\(key)=\(added[key]!)") }
         return 0
+    case "set":
+        guard args.count >= 2 else { print("usage: --cli set <key> <value>   keys: \(LauncherSettings.settableKeys.joined(separator: ", "))"); return 2 }
+        let value = args.dropFirst(2).joined(separator: " ")
+        do {
+            try settings.set(args[1], value)
+            try settings.save(to: paths.settingsFile)
+            print("\(args[1]) = \(value.isEmpty ? "(empty)" : value)")
+            return 0
+        } catch {
+            print("\(error)"); return 1
+        }
     case "play":
         if let state = LaunchState.load(paths.stateFile), Processes.isAlive(state.pid) {
             print("already running: pid \(state.pid)"); return 1
         }
-        let problems = InstallStatus.problems(InstallStatus.check(paths))
-        guard problems.isEmpty else { print("not ready: \(problems.map(\.title).joined(separator: ", "))"); return 1 }
+        let problems = InstallStatus.problems(InstallStatus.check(paths, settings: settings))
+        guard problems.isEmpty else { print("not ready: \(problems.map { "\($0.title) (\($0.detail))" }.joined(separator: "; "))"); return 1 }
         let others = Processes.emulators().filter { $0.name == "shadps4" }
         if !others.isEmpty && !args.contains("--force") {
             print("another shadps4 is running (pid \(others.map { String($0.pid) }.joined(separator: ", "))); run.sh would stop it. Add --force to go ahead.")
             return 1
         }
-        let r = GameControl.launch(script: paths.runScript, mode: settings.mode, environment: launch, home: home)
+        let base = LaunchEnvironment.base(inherited: ProcessInfo.processInfo.environment,
+                                          loginPath: LaunchEnvironment.loginPath(), home: NSHomeDirectory())
+        let launch = settings.launchEnvironment(base: base, paths: paths)
+        try? FileManager.default.createDirectory(at: paths.dataDir, withIntermediateDirectories: true)
+        let r = GameControl.launch(script: paths.runScript, mode: settings.mode, environment: launch, directory: paths.dataDir)
         print(r.output, terminator: "")
         guard let pid = r.pid, let dir = r.runDir, Processes.isAlive(pid) else { print("game did not stay up"); return 1 }
         try? LaunchState(pid: pid, runDir: dir.path, mode: settings.mode, started: Date()).save(paths.stateFile)
@@ -111,7 +119,7 @@ func cli(_ args: [String]) -> Int32 {
         print("stop pid \(state.pid): \(r)")
         return 0
     default:
-        print("usage: FIFA\\ 16 --cli [status|env|play [--force]|stop]")
+        print("usage: FIFA\\ 16 --cli [status|env|play [--force]|stop|set <key> <value>]")
         return 2
     }
 }

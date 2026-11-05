@@ -5,7 +5,9 @@ Apple Silicon Mac. Code lives in sibling repos; this one holds the glue, launch/
 
 | folder | what | original location |
 |---|---|---|
-| `metal/` | Metal hybrid runner (`run.sh`), ball/texture/mesh fixers, autotest helpers, `PLAN.md`, `bbport.ini`, launcher app sources, GPU host app wrapper | `~/fifa_metal/` |
+| `metal/` | Metal hybrid runner (`run.sh`), ball/texture/mesh fixers, autotest helpers, `PLAN.md`, `bbport.ini`, GPU host app wrapper | `~/fifa_metal/` |
+| `metal/launcher/` | FIFA 16.app sources (SwiftUI, four-folder self-contained launcher), `build.sh --test` | `~/fifa_metal/launcher/` |
+| `metal/app/` | `make_app.sh <version>`: assembles the self-contained FIFA 16.app (emulator, libbbgpu, host, run.sh, fifamod), fixes rpaths, signs, zips; the bundled `run.sh` | `~/fifa_metal/app/` |
 | `perf/` | Vulkan side build scripts, side-changes patch, autotest OCR helpers | `~/fifa_perf/` |
 | `home/` | `fifa_run.sh`, `fifa_perf.sh`, `fifa_overlay.sh`, `fifa_autotest.sh`, build/install helpers | `~/` |
 | `skill/` | Claude Code skill: installing PC patches on the PS4 game (formats, Lua fixes, emulator notes, BIG4 reader) | `~/.claude/skills/fifa-pc-patch-on-ps4/` |

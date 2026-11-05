@@ -1,10 +1,11 @@
-// FIFA 16 launcher window: game art header, status and settings (two grouped forms, as in the
-// Bloodborne port's launcher), the log page, and the Play/Stop bar.
+// FIFA 16 launcher window: game art header, the four folders and the installation checklist,
+// the options (two grouped forms, as in the Bloodborne port's launcher), the log page, and the
+// Play/Stop bar.
 import AppKit
 import SwiftUI
 
 struct LauncherView: View {
-    static let size = CGSize(width: 900, height: 700)
+    static let size = CGSize(width: 900, height: 720)
     @ObservedObject var model: LauncherModel
 
     var body: some View {
@@ -34,32 +35,22 @@ struct LauncherView: View {
     private var gamePage: some View {
         HStack(alignment: .top, spacing: 0) {
             Form {
-                Section("Installation") {
-                    ForEach(model.status) { item in
-                        HStack {
-                            StatusRow(item: item)
-                            if item.action == .refreshHost {
-                                Spacer()
-                                Button("Refresh host", action: model.refreshHost)
-                                    .disabled(!model.canRefreshHost)
-                                    .help(model.canRefreshHost ? "Runs bash ~/fifa_metal/host_app/refresh.sh"
-                                                               : "Not while an emulator is running: it uses these files")
-                            }
-                        }
+                Section("Folders") {
+                    if model.firstLaunch {
+                        Label("Choose the game folder to start: the dumped CUSA02138 folder with eboot.bin and sce_sys/ inside. Everything else is inside this app.",
+                              systemImage: "info.circle")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    ForEach(LauncherModel.Folder.allCases) { folder in
+                        FolderRow(model: model, folder: folder)
                     }
                 }
-                Section("Patch overlay") {
-                    Picker("Overlay", selection: Binding(get: { model.currentOverlay ?? "" },
-                                                         set: { model.selectOverlay($0) })) {
-                        if model.currentOverlay == nil { Text("None").tag("") }
-                        ForEach(model.overlays, id: \.self) { Text(Overlay.label($0)).tag($0) }
-                    }
-                    .disabled(model.running || model.overlays.isEmpty)
-                    Text("The FIP and test overlays in ~/fifa_perf/overlay. Switching re-points the Metal build's download/CUSA02138 link (asks first).")
-                        .font(.caption).foregroundStyle(.secondary)
+                Section("Installation") {
+                    ForEach(model.status) { item in StatusRow(item: item) }
                 }
             }
             .formStyle(.grouped)
+            .disabled(model.running)
             Form {
                 Section("Display") {
                     Picker("Window", selection: $model.settings.fullscreen) {
@@ -67,10 +58,10 @@ struct LauncherView: View {
                         Text("Full screen").tag(true)
                     }
                     .pickerStyle(.segmented)
-                    Text("BB_FULLSCREEN. Full screen is run.sh's default.").font(.caption).foregroundStyle(.secondary)
+                    Text("BB_FULLSCREEN. Full screen is the default.").font(.caption).foregroundStyle(.secondary)
                     Toggle("Low-latency presentation (display sync off)", isOn: $model.settings.lowLatency)
                         .help("BB_PRESENT_MODE=Immediate")
-                    Text("Measured here: flip-to-screen 18 to 22 ms instead of 25 to 29 ms, but on a non-ProMotion display it can tear, which is why it is opt-in.")
+                    Text("Measured: flip-to-screen 18 to 22 ms instead of 25 to 29 ms, but on a non-ProMotion display it can tear, which is why it is opt-in.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Section("Diagnostics") {
@@ -82,8 +73,8 @@ struct LauncherView: View {
                         ForEach(RunMode.allCases) { Text($0.label).tag($0) }
                     }
                     Text(model.settings.mode == .play
-                         ? "run.sh play: the emulator log keeps errors only."
-                         : "run.sh start: full emulator log, plus screenshots and CPU/GPU stats every 20 s in the run folder.")
+                         ? "play: the emulator log keeps errors only."
+                         : "start: full emulator log, plus screenshots and CPU/GPU stats every 20 s in the run folder.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Section("Launch") {
@@ -92,18 +83,20 @@ struct LauncherView: View {
                             .multilineTextAlignment(.trailing)
                     }
                     HStack {
-                        Button("Reset to run.sh Defaults", action: model.resetSettings)
-                            .disabled(model.settings == LauncherSettings())
+                        Button("Reset Options", action: model.resetOptions)
+                            .disabled(model.optionsAreDefault)
                         Spacer()
                         Button("Show settings.json", action: model.openSettingsFile)
                     }
                     Text("Settings apply at the next Play.").font(.caption).foregroundStyle(.secondary)
                 }
-                Section("Folders") {
+                Section("Open") {
                     HStack {
-                        Button("Open Run Folder", action: model.openRunFolder).disabled(model.runFolder == nil)
+                        Button("Run Folder", action: model.openRunFolder).disabled(model.runFolder == nil)
                         Button("All Runs", action: model.openRuns)
-                        Button("Open Shader Cache", action: model.openShaderCache)
+                        Button("Saves", action: model.openSaves)
+                        Button("Mods", action: model.openMods).disabled(model.folders.mods == nil)
+                        Button("Shader Cache", action: model.openShaderCache)
                     }
                     if let dir = model.runFolder {
                         Text(dir.path).font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
@@ -151,12 +144,34 @@ struct LauncherView: View {
     }
 }
 
+private struct FolderRow: View {
+    @ObservedObject var model: LauncherModel
+    let folder: LauncherModel.Folder
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text(folder.title)
+                let path = model.folderPath(folder)
+                Text(model.folderIsSet(folder) ? path : "not set")
+                    .font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.head)
+                    .help(path.isEmpty ? folder.hint : path)
+            }
+            Spacer()
+            if folder.clearable && model.folderIsSet(folder) {
+                Button("Clear") { model.clearFolder(folder) }
+            }
+            Button("Choose…") { model.chooseFolder(folder) }.help(folder.hint)
+        }
+    }
+}
+
 private struct Header: View {
     @ObservedObject var model: LauncherModel
 
     var body: some View {
         ZStack(alignment: .bottomLeading) {
-            if let image = Header.artwork(model.paths) {
+            if let image = Header.artwork(model.folders) {
                 Image(nsImage: image).resizable().aspectRatio(contentMode: .fill)
                     .frame(width: LauncherView.size.width, height: 150).clipped()
             } else {
@@ -167,7 +182,7 @@ private struct Header: View {
             HStack(alignment: .bottom) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("FIFA 16").font(.system(size: 30, weight: .bold)).foregroundStyle(.white)
-                    Text("PS4 CUSA02138 · update 1.07 · shadPS4 with the native Metal renderer")
+                    Text("PS4 CUSA02138 · shadPS4 with the native Metal renderer")
                         .font(.callout).foregroundStyle(.white.opacity(0.8))
                 }
                 Spacer()
@@ -178,12 +193,14 @@ private struct Header: View {
         .frame(width: LauncherView.size.width, height: 150)
     }
 
-    private static var cached: NSImage??
-    static func artwork(_ paths: Paths) -> NSImage? {
-        if let cached { return cached }
+    private static var cached: [String: NSImage?] = [:]
+    /// The bundled banner, else the game's own header art once a game folder is set.
+    static func artwork(_ folders: GameFolders) -> NSImage? {
+        let key = folders.artwork?.path ?? ""
+        if let cached = cached[key] { return cached }
         let image = Bundle.main.url(forResource: "banner", withExtension: "jpg").flatMap(NSImage.init(contentsOf:))
-            ?? NSImage(contentsOf: paths.artwork)
-        cached = .some(image)
+            ?? folders.artwork.flatMap(NSImage.init(contentsOf:))
+        cached[key] = .some(image)
         return image
     }
 }
