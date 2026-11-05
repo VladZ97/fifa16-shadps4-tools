@@ -1,0 +1,1966 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 2667a860..c7ed3a4b 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -949,6 +949,8 @@ set(CORE src/core/aerolib/stubs.cpp
+          src/core/file_format/trp.h
+          src/core/file_format/npbind.cpp
+          src/core/file_format/npbind.h
++         src/core/file_sys/dir_index.cpp
++         src/core/file_sys/dir_index.h
+          src/core/file_sys/fs.cpp
+          src/core/file_sys/fs.h
+          src/core/file_sys/ifile.cpp
+diff --git a/src/core/file_sys/backends/host_fs.cpp b/src/core/file_sys/backends/host_fs.cpp
+index 45d56cad..a63723e1 100644
+--- a/src/core/file_sys/backends/host_fs.cpp
++++ b/src/core/file_sys/backends/host_fs.cpp
+@@ -6,6 +6,7 @@
+ 
+ #include "common/string_util.h"
+ #include "core/file_sys/backends/host_fs.h"
++#include "core/file_sys/dir_index.h"
+ #include "core/file_sys/fs.h"
+ 
+ namespace Core::FileSys {
+@@ -131,10 +132,6 @@ std::filesystem::path HostFsBackend::Resolve(std::string_view rel_path) const {
+     if constexpr (!NeedsCaseInsensitiveSearch) {
+         return direct;
+     } else {
+-        std::error_code ec;
+-        if (std::filesystem::exists(direct, ec)) {
+-            return direct;
+-        }
+         return ResolveCaseInsensitive(rel_path).value_or(std::move(direct));
+     }
+ }
+@@ -162,35 +159,27 @@ std::optional<std::filesystem::path> HostFsBackend::ResolveCaseInsensitive(
+             continue;
+         }
+ 
+-        if (std::filesystem::path candidate = current / part_str;
+-            std::filesystem::exists(candidate, ec)) {
+-            current = std::move(candidate);
+-            m_case_cache.emplace(prefix, current);
+-            continue;
+-        }
+-
+-        const std::string part_low = Common::ToLower(part_str);
+-        bool found = false;
+-        for (const auto& entry : std::filesystem::directory_iterator(current, ec)) {
+-            const auto name = entry.path().filename();
+-            if (Common::ToLower(name.string()) != part_low) {
+-                continue;
+-            }
+-            current /= name;
+-            m_case_cache.emplace(prefix, current);
+-            found = true;
+-            break;
+-        }
+-        if (!found) {
++        // Local change: one cached listing per directory instead of stat + directory scan.
++        const auto actual = DirIndex::Instance().Lookup(current, part_str);
++        if (!actual) {
+             return std::nullopt;
+         }
++        current /= *actual;
++        m_case_cache.emplace(prefix, current);
+     }
+     return current;
+ }
+ 
+ bool HostFsBackend::Exists(std::string_view rel_path) {
+-    std::error_code ec;
+-    return std::filesystem::exists(Resolve(rel_path), ec);
++    if constexpr (NeedsCaseInsensitiveSearch) {
++        if (rel_path.empty()) {
++            return true;
++        }
++        return ResolveCaseInsensitive(rel_path).has_value();
++    } else {
++        std::error_code ec;
++        return std::filesystem::exists(Resolve(rel_path), ec);
++    }
+ }
+ 
+ bool HostFsBackend::IsDirectory(std::string_view rel_path) {
+@@ -226,6 +215,9 @@ std::unique_ptr<IFile> HostFsBackend::Open(std::string_view rel_path,
+     if (!handle->IsOpen()) {
+         return nullptr;
+     }
++    if (mode == Common::FS::FileAccessMode::Create) {
++        DirIndex::Instance().InvalidateParent(path);
++    }
+     return handle;
+ }
+ 
+diff --git a/src/core/file_sys/dir_index.cpp b/src/core/file_sys/dir_index.cpp
+new file mode 100644
+index 00000000..4d413211
+--- /dev/null
++++ b/src/core/file_sys/dir_index.cpp
+@@ -0,0 +1,49 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++#include <system_error>
++#include "common/string_util.h"
++#include "core/file_sys/dir_index.h"
++
++namespace Core::FileSys {
++
++DirIndex& DirIndex::Instance() {
++    static DirIndex instance;
++    return instance;
++}
++
++const DirIndex::Listing& DirIndex::Get(const std::filesystem::path& dir) {
++    const auto key = dir.string();
++    if (const auto it = dirs.find(key); it != dirs.end()) {
++        return it->second;
++    }
++    Listing listing{};
++    std::error_code ec;
++    if (std::filesystem::is_directory(dir, ec)) {
++        listing.exists = true;
++        for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
++            const auto name = entry.path().filename().string();
++            listing.names.emplace(Common::ToLower(name), name);
++        }
++    }
++    return dirs.emplace(key, std::move(listing)).first->second;
++}
++
++std::optional<std::filesystem::path> DirIndex::Lookup(const std::filesystem::path& dir,
++                                                      std::string_view name) {
++    std::scoped_lock lk{mutex};
++    const auto& listing = Get(dir);
++    if (!listing.exists) {
++        return std::nullopt;
++    }
++    const auto it = listing.names.find(Common::ToLower(std::string{name}));
++    if (it == listing.names.end()) {
++        return std::nullopt;
++    }
++    return std::filesystem::path{it->second};
++}
++
++void DirIndex::Invalidate(const std::filesystem::path& dir) {
++    std::scoped_lock lk{mutex};
++    dirs.erase(dir.string());
++}
++
++} // namespace Core::FileSys
+diff --git a/src/core/file_sys/dir_index.h b/src/core/file_sys/dir_index.h
+new file mode 100644
+index 00000000..dfa266a1
+--- /dev/null
++++ b/src/core/file_sys/dir_index.h
+@@ -0,0 +1,40 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++// Local change (FIFA 16 on macOS): per-directory name index so case-insensitive lookups of missing
++// files cost one hash lookup instead of a stat plus a full directory listing per probe. Games that
++// probe dozens of candidate asset names per object spent most of their loading time in those scans.
++#pragma once
++
++#include <filesystem>
++#include <mutex>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <unordered_map>
++
++namespace Core::FileSys {
++
++class DirIndex {
++public:
++    static DirIndex& Instance();
++
++    /// Actual on-disk name of `name` inside `dir` (case-insensitive), or nullopt if absent.
++    std::optional<std::filesystem::path> Lookup(const std::filesystem::path& dir,
++                                                std::string_view name);
++    /// Drop the cached listing of `dir` (call after creating/removing/renaming entries in it).
++    void Invalidate(const std::filesystem::path& dir);
++    void InvalidateParent(const std::filesystem::path& path) {
++        Invalidate(path.parent_path());
++    }
++
++private:
++    struct Listing {
++        bool exists{};
++        std::unordered_map<std::string, std::string> names; // lowercase -> actual
++    };
++    const Listing& Get(const std::filesystem::path& dir);
++
++    std::mutex mutex;
++    std::unordered_map<std::string, Listing> dirs;
++};
++
++} // namespace Core::FileSys
+diff --git a/src/core/file_sys/fs.cpp b/src/core/file_sys/fs.cpp
+index 25d2b792..d99c9028 100644
+--- a/src/core/file_sys/fs.cpp
++++ b/src/core/file_sys/fs.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include <unordered_map>
+ #include <array>
+ #include <unordered_set>
+ #include "common/assert.h"
+@@ -11,6 +12,7 @@
+ #include "core/file_sys/backends/zarchive_fs.h"
+ #include "core/file_sys/devices/logger.h"
+ #include "core/file_sys/devices/nop_device.h"
++#include "core/file_sys/dir_index.h"
+ #include "core/file_sys/fs.h"
+ 
+ namespace Core::FileSys {
+@@ -228,8 +230,20 @@ std::filesystem::path MntPoints::GetHostPath(std::string_view path, bool* is_rea
+     std::filesystem::path host_path = mount->host_path;
+ 
+     // Update folder is either mount + "-UPDATE" or mount + "-patch"
++    // Local change: overlay roots do not change while running; memoize their existence.
++    static std::mutex overlay_mutex;
++    static std::unordered_map<std::string, bool> overlay_exists;
++    const auto root_exists = [&](const std::filesystem::path& p) {
++        std::scoped_lock lk{overlay_mutex};
++        const auto key = p.string();
++        if (const auto it = overlay_exists.find(key); it != overlay_exists.end()) {
++            return it->second;
++        }
++        std::error_code ec;
++        return overlay_exists.emplace(key, std::filesystem::exists(p, ec)).first->second;
++    };
+     std::filesystem::path patch_path = OverlayPath(mount->host_path, "-UPDATE");
+-    if (!std::filesystem::exists(patch_path)) {
++    if (!root_exists(patch_path)) {
+         patch_path = OverlayPath(mount->host_path, "-patch");
+     }
+ 
+@@ -276,82 +290,59 @@ std::filesystem::path MntPoints::GetHostPath(std::string_view path, bool* is_rea
+         return host_path;
+     }
+ 
+-    const auto search = [&](const auto host_path) {
+-        // If the path does not exist attempt to verify this.
+-        // Retrieve parent path until we find one that exists.
+-        std::scoped_lock lk{m_mutex};
+-        path_parts.clear();
+-        auto current_path = host_path;
+-        std::error_code ec;
+-        while (!current_path.empty() && !std::filesystem::exists(current_path, ec)) {
+-            if (ec) {
+-                LOG_ERROR(Kernel_Fs, "fs::exists returned {}", ec.message());
+-                current_path = "";
+-                break;
+-            }
+-            // We have probably cached this if it's a folder.
+-            if (auto it = path_cache.find(current_path); it != path_cache.end()) {
+-                current_path = it->second;
+-                break;
++    // Local change: resolve the relative path component by component through the directory
++    // index (one cached listing per directory) instead of stat() + directory scans per lookup.
++    const auto search = [&](const std::filesystem::path& root) -> std::optional<std::filesystem::path> {
++        std::filesystem::path full = root;
++        if (!rel_path.empty()) {
++            full /= rel_path;
++        }
++        {
++            std::scoped_lock lk{m_mutex};
++            if (auto it = path_cache.find(full); it != path_cache.end()) {
++                return it->second;
+             }
+-            path_parts.emplace_back(current_path.filename());
+-            current_path = current_path.parent_path();
+         }
+-        if (!current_path.empty()) {
+-            // We have found an anchor. Traverse parts we recoded and see if they
+-            // exist in filesystem but in different case.
+-            auto guest_path = current_path;
+-            while (!path_parts.empty()) {
+-                const auto part = path_parts.back();
+-                const auto add_match = [&](const auto& host_part) {
+-                    current_path /= host_part;
+-                    guest_path /= part;
+-                    path_cache[guest_path] = current_path;
+-                    path_parts.pop_back();
+-                };
+-                // Can happen when the mismatch is in upper folder.
+-                std::error_code ec;
+-                if (std::filesystem::exists(current_path / part, ec)) {
+-                    add_match(part);
++        auto& index = DirIndex::Instance();
++        std::filesystem::path current = root;
++        if (!rel_path.empty()) {
++            for (const auto& part : std::filesystem::path{rel_path}) {
++                const auto part_str = part.string();
++                if (part_str.empty() || part_str == ".") {
+                     continue;
+-                } else if (ec) {
+-                    LOG_ERROR(Kernel_Fs, "fs::exists returned {}", ec.message());
+-                }
+-                const auto part_low = Common::ToLower(part.string());
+-                bool found_match = false;
+-                for (const auto& path : std::filesystem::directory_iterator(current_path, ec)) {
+-                    const auto candidate = path.path().filename();
+-                    const auto filename = Common::ToLower(candidate.string());
+-                    // Check if a filename matches in case insensitive manner.
+-                    if (filename != part_low) {
+-                        continue;
+-                    }
+-                    // We found a match, record the actual path in the cache.
+-                    add_match(candidate);
+-                    found_match = true;
+-                    break;
+                 }
+-                if (!found_match) {
+-                    return std::optional<std::filesystem::path>({});
++                const auto actual = index.Lookup(current, part_str);
++                if (!actual) {
++                    return std::nullopt;
+                 }
++                current /= *actual;
++            }
++        } else {
++            std::error_code ec;
++            if (!std::filesystem::exists(current, ec)) {
++                return std::nullopt;
+             }
+         }
+-        return std::optional<std::filesystem::path>(current_path);
++        std::scoped_lock lk{m_mutex};
++        path_cache[full] = current;
++        return current;
+     };
+ 
+     if ((corrected_path.starts_with("/app0") || corrected_path.starts_with("/hostapp")) &&
+         path_type != HostPathType::Base) {
+-        if (const auto path = search(mods_path)) {
++        if (const auto path = search(OverlayPath(mount->host_path, "-mods"))) {
+             return *path;
+         }
+     }
+ 
+     if (path_type != HostPathType::Base && !ignore_game_patches) {
+-        if (const auto path = search(patch_path)) {
++        if (const auto path = search(root_exists(OverlayPath(mount->host_path, "-UPDATE"))
++                                         ? OverlayPath(mount->host_path, "-UPDATE")
++                                         : OverlayPath(mount->host_path, "-patch"))) {
+             return *path;
+         }
+     }
+-    if (const auto path = search(host_path)) {
++    if (const auto path = search(mount->host_path)) {
+         return *path;
+     }
+ 
+diff --git a/src/core/libraries/gnmdriver/gnmdriver.cpp b/src/core/libraries/gnmdriver/gnmdriver.cpp
+index c30c474c..c733e0a6 100644
+--- a/src/core/libraries/gnmdriver/gnmdriver.cpp
++++ b/src/core/libraries/gnmdriver/gnmdriver.cpp
+@@ -1,3 +1,4 @@
++#include <cstdlib>
+ // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+@@ -66,6 +67,7 @@ static constexpr bool UseNeoCompatSequences = false;
+ // In case if `submitDone` is issued we need to block submissions until GPU idle
+ static u32 submission_lock{};
+ std::condition_variable cv_lock{};
++static std::mutex m_flip_submission{}; // local: serialize EOP flip submissions (upstream PR #5039)
+ std::mutex m_wait_idle{};
+ std::mutex m_submit_lock{};
+ static u64 frames_submitted{};      // frame counter
+@@ -1471,7 +1473,10 @@ s32 PS4_SYSV_ABI sceGnmRequestFlipAndSubmitDoneForWorkload(u64 workload, u32* gp
+     }
+     liverpool->SubmitGfx(dcb_span, {});
+ 
+-    if (!liverpool->IsGpuIdle()) {
++    // Local change: SHAD_NO_SUBMISSION_LOCK=1 lets the game keep submitting while the previous
++    // frame is still being processed (use with SHAD_COPY_GPU_BUFFERS=1 so command buffers are copied).
++    static const bool no_submission_lock = std::getenv("SHAD_NO_SUBMISSION_LOCK") != nullptr;
++    if (!no_submission_lock && !liverpool->IsGpuIdle()) {
+         submission_lock = true;
+     }
+     liverpool->SubmitDone();
+@@ -2377,6 +2382,8 @@ s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffersForWorkload(
+     u32* ccb_sizes_in_bytes, u32 vo_handle, u32 buf_idx, u32 flip_mode, s64 flip_arg) {
+     LOG_DEBUG(Lib_GnmDriver, "called [buf = {}]", buf_idx);
+ 
++    std::scoped_lock flip_lock{m_flip_submission};
++
+     if (count != 0) {
+         if (!dcb_gpu_addrs) {
+             LOG_ERROR(Lib_GnmDriver, "dcbGpuAddrs must not be NULL");
+@@ -2474,7 +2481,10 @@ s32 PS4_SYSV_ABI sceGnmSubmitDone() {
+     LOG_DEBUG(Lib_GnmDriver, "called");
+     std::scoped_lock lk{m_submit_lock};
+     WaitGpuIdle();
+-    if (!liverpool->IsGpuIdle()) {
++    // Local change: SHAD_NO_SUBMISSION_LOCK=1 lets the game keep submitting while the previous
++    // frame is still being processed (use with SHAD_COPY_GPU_BUFFERS=1 so command buffers are copied).
++    static const bool no_submission_lock = std::getenv("SHAD_NO_SUBMISSION_LOCK") != nullptr;
++    if (!no_submission_lock && !liverpool->IsGpuIdle()) {
+         submission_lock = true;
+     }
+     liverpool->SubmitDone();
+@@ -3044,7 +3054,8 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
+         sdk_version = 0;
+     }
+ 
+-    if (EmulatorSettings.IsCopyGpuBuffers()) {
++    static const bool force_copy = std::getenv("SHAD_COPY_GPU_BUFFERS") != nullptr;
++    if (EmulatorSettings.IsCopyGpuBuffers() || force_copy) {
+         liverpool->ReserveCopyBufferSpace();
+     }
+ 
+diff --git a/src/core/libraries/kernel/file_system.cpp b/src/core/libraries/kernel/file_system.cpp
+index 25c50cc1..55f163ef 100644
+--- a/src/core/libraries/kernel/file_system.cpp
++++ b/src/core/libraries/kernel/file_system.cpp
+@@ -1,3 +1,4 @@
++#include <atomic>
+ // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+@@ -5,6 +6,7 @@
+ #include <climits>
+ #include <condition_variable>
+ #include <cstdint>
++#include <algorithm>
+ #include <map>
+ #include <mutex>
+ #include <unordered_map>
+@@ -35,6 +37,7 @@
+ #include "core/file_sys/devices/zero_device.h"
+ #include "core/file_sys/directories/normal_directory.h"
+ #include "core/file_sys/directories/pfs_directory.h"
++#include "core/file_sys/dir_index.h"
+ #include "core/file_sys/fs.h"
+ #include "core/libraries/kernel/file_system.h"
+ #include "core/libraries/kernel/orbis_error.h"
+@@ -148,7 +151,28 @@ void ReleaseFlockState(Core::FileSys::File* file) {
+ 
+ } // anonymous namespace
+ 
++// Local diagnostic: time spent in opens that fail with ENOENT (FIFA's Lua candidate chains
++// probe tens of missing files per asset). Summary line every 500 failures.
++static void NoteFailedOpen(std::chrono::steady_clock::time_point t0) {
++    static std::atomic<u64> count{0}, spent_us{0}, max_us{0};
++    static std::atomic<s64> window_start{0};
++    const auto now = std::chrono::steady_clock::now();
++    const u64 us = std::chrono::duration_cast<std::chrono::microseconds>(now - t0).count();
++    spent_us += us;
++    u64 m = max_us.load();
++    while (us > m && !max_us.compare_exchange_weak(m, us)) {
++    }
++    const u64 n = ++count;
++    if (n % 500 == 0) {
++        const s64 now_us = std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count();
++        const s64 ws = window_start.exchange(now_us);
++        LOG_INFO(Kernel_Fs, "FSNEG n={} window_ms={} spent_ms={} max_us={}", n,
++                 ws ? (now_us - ws) / 1000 : 0, spent_us.exchange(0) / 1000, max_us.exchange(0));
++    }
++}
++
+ s32 PS4_SYSV_ABI open(const char* raw_path, s32 flags, u16 mode) {
++    const auto open_t0 = std::chrono::steady_clock::now();
+     LOG_INFO(Kernel_Fs, "path = {} flags = {:#x} mode = {:#o}", raw_path, flags, mode);
+ 
+     auto* h = Common::Singleton<Core::FileSys::HandleTable>::Instance();
+@@ -192,7 +216,15 @@ s32 PS4_SYSV_ABI open(const char* raw_path, s32 flags, u16 mode) {
+         LOG_ERROR(Kernel_Fs, "Opening path {} failed, invalid path", raw_path);
+         return -1;
+     }
+-    const std::string& path = *sanitized_path;
++    std::string path = *sanitized_path;
++    if (!path.starts_with('/')) {
++        // Local change: FIFA's competition engine (with PC patch data) opens Windows-style
++        // relative paths such as "logs\conflict.txt" for debug logs and then writes through
++        // the handle without checking for failure. Give relative paths a writable home.
++        std::replace(path.begin(), path.end(), '\\', '/');
++        path = "/data/" + path;
++        LOG_WARNING(Kernel_Fs, "Relative path {} redirected to {}", raw_path, path);
++    }
+     u32 handle = h->CreateHandle();
+     auto* file = h->GetFile(handle);
+ 
+@@ -239,12 +271,14 @@ s32 PS4_SYSV_ABI open(const char* raw_path, s32 flags, u16 mode) {
+             }
+             // Create a file if it doesn't exist
+             Common::FS::IOFile out(file->m_host_name, Common::FS::FileAccessMode::Create);
++            Core::FileSys::DirIndex::Instance().InvalidateParent(file->m_host_name);
+         }
+     } else if (!exists) {
+         // If we're not creating a file, and it doesn't exist, return ENOENT
+         h->DeleteHandle(handle);
+         *__Error() = POSIX_ENOENT;
+         LOG_ERROR(Kernel_Fs, "Opening path {} failed, file does not exist", raw_path);
++        NoteFailedOpen(open_t0);
+         return -1;
+     }
+ 
+@@ -700,6 +734,7 @@ s32 PS4_SYSV_ABI posix_mkdir(const char* path, u16 mode) {
+     }
+ 
+     std::error_code ec;
++    Core::FileSys::DirIndex::Instance().InvalidateParent(dir_name);
+     if (dir_name.empty() || !fs::create_directory(dir_name, ec)) {
+         if (ec == std::errc::no_such_file_or_directory) {
+             *__Error() = POSIX_ENOENT;
+@@ -764,6 +799,7 @@ s32 PS4_SYSV_ABI posix_rmdir(const char* path) {
+         return -1;
+     }
+ 
++    Core::FileSys::DirIndex::Instance().InvalidateParent(dir_name);
+     fs::remove(dir_name, ec);
+ 
+     if (ec == std::errc::directory_not_empty) {
+@@ -1391,6 +1427,8 @@ s32 PS4_SYSV_ABI posix_rename(const char* from, const char* to) {
+         return -1;
+     }
+     const auto dst_path = mnt->GetHostPath(to, &ro);
++    Core::FileSys::DirIndex::Instance().InvalidateParent(src_path);
++    Core::FileSys::DirIndex::Instance().InvalidateParent(dst_path);
+     if (ro) {
+         *__Error() = POSIX_EROFS;
+         return -1;
+@@ -1910,6 +1948,7 @@ s32 PS4_SYSV_ABI posix_unlink(const char* path) {
+ 
+     bool ro = false;
+     const auto host_path = mnt->GetHostPath(path, &ro);
++    Core::FileSys::DirIndex::Instance().InvalidateParent(host_path);
+     if (host_path.empty()) {
+         *__Error() = POSIX_ENOENT;
+         return -1;
+diff --git a/src/core/libraries/kernel/kernel.cpp b/src/core/libraries/kernel/kernel.cpp
+index 735f7d70..8f0aa991 100644
+--- a/src/core/libraries/kernel/kernel.cpp
++++ b/src/core/libraries/kernel/kernel.cpp
+@@ -1,6 +1,7 @@
+ // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <cstdlib>
+ #include <thread>
+ #include <boost/asio/io_context.hpp>
+ 
+@@ -83,11 +84,19 @@ static PS4_SYSV_ABI void stack_chk_fail() {
+     void* caller = __builtin_return_address(0);
+     auto* linker = Common::Singleton<Core::Linker>::Instance();
+     auto* mod = linker ? linker->FindByAddress(reinterpret_cast<VAddr>(caller)) : nullptr;
++    // Local change: SHAD_STACK_CHK_IGNORE=1 logs the failed stack check and lets the game
++    // continue. Useful when the overflow is a few bytes that only reach the canary.
++    static const bool ignore = std::getenv("SHAD_STACK_CHK_IGNORE") != nullptr;
+     if (mod) {
+-        LOG_CRITICAL(Lib_Kernel, "called from {:p} (module: {}, offset: {:#x})", caller, mod->name,
+-                     reinterpret_cast<VAddr>(caller) - mod->GetBaseAddress());
++        LOG_CRITICAL(Lib_Kernel, "called from {:p} (module: {}, offset: {:#x}){}", caller, mod->name,
++                     reinterpret_cast<VAddr>(caller) - mod->GetBaseAddress(),
++                     ignore ? " - ignored" : "");
+     } else {
+-        LOG_CRITICAL(Lib_Kernel, "called from {:p} (unknown module)", caller);
++        LOG_CRITICAL(Lib_Kernel, "called from {:p} (unknown module){}", caller,
++                     ignore ? " - ignored" : "");
++    }
++    if (ignore) {
++        return;
+     }
+     UNREACHABLE();
+ }
+diff --git a/src/core/libraries/videoout/driver.cpp b/src/core/libraries/videoout/driver.cpp
+index 8d8d988a..8f629bb9 100644
+--- a/src/core/libraries/videoout/driver.cpp
++++ b/src/core/libraries/videoout/driver.cpp
+@@ -270,8 +270,9 @@ void VideoOutDriver::Flip(const Request& req) {
+ 
+     // Reset prev flip label
+     if (port->prev_index != -1) {
++        std::scoped_lock lock{port->vo_mutex};
+         port->buffer_labels[port->prev_index] = 0;
+-        port->SignalVoLabel();
++        port->vo_cv.notify_one();
+     }
+     // save to prev buf index
+     port->prev_index = req.index;
+diff --git a/src/core/libraries/videoout/video_out.cpp b/src/core/libraries/videoout/video_out.cpp
+index 1cf6d2a8..3349b547 100644
+--- a/src/core/libraries/videoout/video_out.cpp
++++ b/src/core/libraries/videoout/video_out.cpp
+@@ -351,9 +351,21 @@ s32 sceVideoOutSubmitEopFlip(s32 handle, u32 buf_id, u32 mode, s64 flip_arg, voi
+     Platform::IrqC::Instance()->RegisterOnce(
+         Platform::InterruptId::GfxFlip, [=](Platform::InterruptId irq) {
+             ASSERT_MSG(irq == Platform::InterruptId::GfxFlip, "An unexpected IRQ occured");
+-            ASSERT_MSG(port->buffer_labels[buf_id] == 1, "Out of order flip IRQ");
++            {
++                std::scoped_lock lock{port->vo_mutex};
++                if (port->buffer_labels[buf_id] != 1) {
++                    // Local change: the upstream code asserts here ("Out of order flip IRQ").
++                    // FIFA 16 trips it at scene transitions when two flips race; the buffer's
++                    // flip was already handled, so skipping this one costs at most a hitch.
++                    LOG_WARNING(Lib_VideoOut, "Out of order flip IRQ for buffer {} (label {}), skipping",
++                                buf_id, port->buffer_labels[buf_id]);
++                    return;
++                }
++            }
+             const auto result = driver->SubmitFlip(port, buf_id, flip_arg, true);
+-            ASSERT_MSG(result, "EOP flip submission failed");
++            if (!result) {
++                LOG_ERROR(Lib_VideoOut, "EOP flip submission failed for buffer {}", buf_id);
++            }
+         });
+ 
+     return ORBIS_OK;
+diff --git a/src/core/memory.cpp b/src/core/memory.cpp
+index b05d329b..6f8df140 100644
+--- a/src/core/memory.cpp
++++ b/src/core/memory.cpp
+@@ -204,6 +204,27 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
+     return true;
+ }
+ 
++void* MemoryManager::TryGetBacking(const void* address, u64 size) {
++    const VAddr virtual_addr = std::bit_cast<VAddr>(address);
++    std::shared_lock lk{mutex};
++    if (!IsValidMapping(virtual_addr, size)) {
++        return nullptr;
++    }
++    const auto vma_it = FindVMA(virtual_addr);
++    const auto& vma = vma_it->second;
++    if (!vma.Overlaps(virtual_addr, size) || !HasPhysicalBacking(vma) ||
++        virtual_addr + size > vma.base + vma.size) {
++        return nullptr;
++    }
++    const u64 start_in_vma = virtual_addr - vma.base;
++    const auto phys_handle = std::prev(vma.phys_areas.upper_bound(start_in_vma));
++    const u64 start_in_dma = start_in_vma - phys_handle->first;
++    if (start_in_dma + size > phys_handle->second.size) {
++        return nullptr;
++    }
++    return impl.BackingBase() + phys_handle->second.base + start_in_dma;
++}
++
+ PAddr MemoryManager::PoolExpand(PAddr search_start, PAddr search_end, u64 size, u64 alignment) {
+     std::scoped_lock lk{mutex, unmap_mutex};
+     alignment = alignment > 0 ? alignment : 64_KB;
+diff --git a/src/core/memory.h b/src/core/memory.h
+index dc0b8ea6..c5a90cb0 100644
+--- a/src/core/memory.h
++++ b/src/core/memory.h
+@@ -258,6 +258,10 @@ public:
+ 
+     bool TryWriteBacking(void* address, const void* data, u64 size);
+ 
++    /// Local change: pointer into the unprotected backing alias of [address, address+size),
++    /// or nullptr if the range is not physically backed by one contiguous area.
++    void* TryGetBacking(const void* address, u64 size);
++
+     void SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1, bool use_extended_mem2);
+ 
+     PAddr PoolExpand(PAddr search_start, PAddr search_end, u64 size, u64 alignment);
+diff --git a/src/shader_recompiler/frontend/fetch_shader.cpp b/src/shader_recompiler/frontend/fetch_shader.cpp
+index c48e91cd..c1e0f86a 100644
+--- a/src/shader_recompiler/frontend/fetch_shader.cpp
++++ b/src/shader_recompiler/frontend/fetch_shader.cpp
+@@ -4,6 +4,7 @@
+ #include <utility>
+ #include "common/assert.h"
+ #include "shader_recompiler/frontend/decode.h"
++#include "video_core/amdgpu/regs_shader.h"
+ #include "shader_recompiler/frontend/fetch_shader.h"
+ #include "shader_recompiler/frontend/opcodes.h"
+ 
+@@ -53,7 +54,10 @@ bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data)
+     };
+     std::array<VsharpLoad, 104> loads{};
+ 
+-    const auto* code = GetFetchShaderCode(info, info.fetch_shader_sgpr_base);
++    const auto* guest_code = GetFetchShaderCode(info, info.fetch_shader_sgpr_base);
++    // Local change: parse through the backing alias (see GetParams) to avoid read faults.
++    const auto* backing = AmdGpu::ShaderCodeBacking(guest_code, 4096);
++    const auto* code = backing ? backing : guest_code;
+     const u32* ptr = code;
+     while (true) {
+         const u32 word0 = *(ptr++);
+diff --git a/src/video_core/amdgpu/liverpool.cpp b/src/video_core/amdgpu/liverpool.cpp
+index 13405763..5140d876 100644
+--- a/src/video_core/amdgpu/liverpool.cpp
++++ b/src/video_core/amdgpu/liverpool.cpp
+@@ -1,3 +1,4 @@
++#include <cstdlib>
+ // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+@@ -21,6 +22,54 @@
+ 
+ namespace AmdGpu {
+ 
++// Local change: a small WriteData into a page that the GPU also writes used to go through the
++// guest mapping, fault, and drain the whole GPU before the write (precise readbacks). Instead
++// write the bytes to the backing alias (CPU pollers see them at once, no fault) and queue the
++// same dwords as GPU fills so the resident copy of the buffer matches and a later download of
++// that page cannot revert the label. SHAD_NO_LABEL_NOFAULT=1 restores the old behaviour.
++static bool WriteLabelNoFault(Vulkan::Rasterizer* rasterizer, void* address, const void* data,
++                              u32 data_size) {
++    static const bool enabled = std::getenv("SHAD_LABEL_NOFAULT") != nullptr;
++    if (!enabled || !rasterizer || data_size == 0 || data_size > 16 || data_size % 4 != 0 ||
++        reinterpret_cast<uintptr_t>(address) % 4 != 0) {
++        return false;
++    }
++    const VAddr addr = reinterpret_cast<VAddr>(address);
++    if (!rasterizer->IsRegionGpuModified(addr, data_size)) {
++        return false; // clean page: the plain write is cheap
++    }
++    auto* memory = Core::Memory::Instance();
++    if (!memory->TryWriteBacking(address, data, data_size)) {
++        return false;
++    }
++    const u32* dwords = static_cast<const u32*>(data);
++    for (u32 i = 0; i < data_size / sizeof(u32); ++i) {
++        rasterizer->FillBuffer(addr + i * sizeof(u32), sizeof(u32), dwords[i], false);
++    }
++    return true;
++}
++
++// Local change: see GetParams in regs_shader.h.
++const u32* ShaderCodeBacking(const u32* code, u64 size) {
++    static const bool disabled = std::getenv("SHAD_NO_BACKING_SHADERS") != nullptr;
++    if (disabled) {
++        return nullptr;
++    }
++    return static_cast<const u32*>(Core::Memory::Instance()->TryGetBacking(code, size));
++}
++
++// Local change: see WaitRegMem. Returns the backing-alias pointer of a memory label, or
++// nullptr (register waits, unbacked memory, or SHAD_NO_BACKING_POLL set).
++static const u32* BackingLabel(const PM4CmdWaitRegMem* wait) {
++    static const bool enabled = std::getenv("SHAD_BACKING_POLL") != nullptr;
++    if (!enabled || wait->mem_space.Value() != PM4CmdWaitRegMem::MemSpace::Memory) {
++        return nullptr;
++    }
++    return static_cast<const u32*>(
++        Core::Memory::Instance()->TryGetBacking(wait->Address<const void*>(), sizeof(u32)));
++}
++
++
+ static const char* dcb_task_name{"DCB_TASK"};
+ static const char* ccb_task_name{"CCB_TASK"};
+ 
+@@ -77,6 +126,9 @@ Liverpool::~Liverpool() {
+     while (!ce_submits.empty()) {
+         ce_submits.front().destroy();
+         ce_submits.pop();
++        if (!ce_parity.empty()) {
++            ce_parity.pop();
++        }
+     }
+     for (auto& queue : mapped_queues) {
+         while (!queue.submits.empty()) {
+@@ -101,6 +153,13 @@ void Liverpool::ProcessCeQueue() {
+         task.destroy();
+         std::scoped_lock lock{queue.m_access};
+         ce_submits.pop();
++        if (!ce_parity.empty()) {
++            const u8 p = ce_parity.front();
++            ce_parity.pop();
++            if (p != 0xFF) {
++                --pending_by_parity[p];
++            }
++        }
+         --num_submits;
+         std::scoped_lock lock2{submit_mutex};
+         submit_cv.notify_all();
+@@ -165,9 +224,17 @@ void Liverpool::Process(std::stop_token stoken) {
+ 
+                 std::scoped_lock lock{queue.m_access};
+                 queue.submits.pop();
++                u8 p = 0xFF;
++                if (!queue.submit_parity.empty()) {
++                    p = queue.submit_parity.front();
++                    queue.submit_parity.pop();
++                }
+ 
+                 --num_submits;
+                 std::scoped_lock lock2{submit_mutex};
++                if (p != 0xFF) {
++                    --pending_by_parity[p];
++                }
+                 submit_cv.notify_all();
+             }
+         }
+@@ -714,6 +781,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
+                 if (event_eos->command == PM4CmdEventWriteEos::Command::GdsStore) {
+                     ASSERT(event_eos->size == 1);
+                     if (rasterizer) {
++                        static const bool log_readbacks = std::getenv("SHAD_LOG_READBACKS") != nullptr;
++                        if (log_readbacks) {
++                            LOG_INFO(Render, "GDSFINISH eos gds_store");
++                        }
+                         rasterizer->Finish();
+                         const u32 value = rasterizer->ReadDataFromGds(event_eos->gds_index);
+                         *event_eos->Address() = value;
+@@ -751,6 +822,19 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
+                 } else if (dma_data->src_sel == DmaDataSrc::Data &&
+                            (dma_data->dst_sel == DmaDataDst::Memory ||
+                             dma_data->dst_sel == DmaDataDst::MemoryUsingL2)) {
++                    // Local change (SHAD_CP_LABEL_WRITES=1): a tiny constant fill to memory is a
++                    // label/fence write. Doing it on the GPU marks the page GPU-modified, so the
++                    // very next WaitRegMem/CPU poll of the label faults and drains the whole GPU
++                    // (precise readbacks). Write it from the CP like WriteData/EOP fences instead.
++                    static const bool cp_label_writes = std::getenv("SHAD_CP_LABEL_WRITES") != nullptr;
++                    if (cp_label_writes && dma_data->NumBytes() <= 16) {
++                        rasterizer->OnFence();
++                        u32* dst = dma_data->DstAddress<u32*>();
++                        for (u32 i = 0; i < dma_data->NumBytes() / sizeof(u32); ++i) {
++                            dst[i] = dma_data->data;
++                        }
++                        break;
++                    }
+                     rasterizer->FillBuffer(dma_data->DstAddress<VAddr>(), dma_data->NumBytes(),
+                                            dma_data->data, false);
+                 } else if (dma_data->src_sel == DmaDataSrc::Gds &&
+@@ -780,7 +864,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
+                     if (rasterizer) {
+                         rasterizer->OnFence();
+                     }
+-                    std::memcpy(address, write_data->data, data_size);
++                    if (vo_port && vo_port->IsVoLabel(address)) {
++                        // Flip label writes race with VideoOutDriver::Flip(), which resets the
++                        // previously displayed buffer's label from the present thread. Serialize
++                        // through vo_mutex (upstream PR #5039).
++                        std::scoped_lock lock{vo_port->vo_mutex};
++                        std::memcpy(address, write_data->data, data_size);
++                        vo_port->vo_cv.notify_one();
++                    } else if (!WriteLabelNoFault(rasterizer, address, write_data->data,
++                                                  data_size)) {
++                        std::memcpy(address, write_data->data, data_size);
++                    }
+                 } else {
+                     UNREACHABLE();
+                 }
+@@ -835,8 +929,21 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
+                     vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
+                     break;
+                 }
+-                while (!wait_reg_mem->Test(regs.reg_array)) {
+-                    YIELD_GFX();
++                // Local change: poll the label through the unprotected backing alias. Reading
++                // it through the guest mapping faults whenever the 4K page was GPU-modified
++                // (precise readbacks), and each fault drains the whole GPU: ~14k drains per
++                // FIFA match. Labels are written by the CP (fences/WriteData), so the backing
++                // bytes are current; every 4096th spin still reads through the guest mapping so
++                // a label that really is written by the GPU resolves too. SHAD_NO_BACKING_POLL=1
++                // restores the old behaviour.
++                {
++                    const u32* backing = BackingLabel(wait_reg_mem);
++                    u32 spins = 0;
++                    while (!(backing && (++spins & 0xFFF) != 0
++                                 ? wait_reg_mem->TestValue(*static_cast<const volatile u32*>(backing))
++                                 : wait_reg_mem->Test(regs.reg_array))) {
++                        YIELD_GFX();
++                    }
+                 }
+                 break;
+             }
+@@ -1141,8 +1248,14 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
+         case PM4ItOpcode::WaitRegMem: {
+             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
+             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
+-            while (!wait_reg_mem->Test(regs.reg_array)) {
+-                YIELD_ASC(vqid);
++            {
++                const u32* backing = BackingLabel(wait_reg_mem);
++                u32 spins = 0;
++                while (!(backing && (++spins & 0xFFF) != 0
++                             ? wait_reg_mem->TestValue(*static_cast<const volatile u32*>(backing))
++                             : wait_reg_mem->Test(regs.reg_array))) {
++                    YIELD_ASC(vqid);
++                }
+             }
+             break;
+         }
+@@ -1192,32 +1305,33 @@ void Liverpool::HandleGetLodStats(const PM4CmdGetLodStats* get_lod) {
+ 
+ Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::span<const u32> ccb) {
+     auto& queue = mapped_queues[GfxQueueId];
+-    ASSERT_MSG(queue.dcb_buffer.capacity() >= queue.dcb_buffer_offset + dcb.size(),
++    const u32 p = OverlapSubmits() ? copy_parity : 0;
++    auto& dcb_buffer = queue.dcb_buffer[p];
++    auto& ccb_buffer = queue.ccb_buffer[p];
++    auto& dcb_offset = queue.dcb_buffer_offset[p];
++    auto& ccb_offset = queue.ccb_buffer_offset[p];
++    ASSERT_MSG(dcb_buffer.capacity() >= dcb_offset + dcb.size(),
+                "dcb copy buffer out of reserved space");
+-    ASSERT_MSG(queue.ccb_buffer.capacity() >= queue.ccb_buffer_offset + ccb.size(),
++    ASSERT_MSG(ccb_buffer.capacity() >= ccb_offset + ccb.size(),
+                "ccb copy buffer out of reserved space");
+ 
+-    queue.dcb_buffer.resize(
+-        std::max(queue.dcb_buffer.size(), queue.dcb_buffer_offset + dcb.size()));
+-    queue.ccb_buffer.resize(
+-        std::max(queue.ccb_buffer.size(), queue.ccb_buffer_offset + ccb.size()));
++    dcb_buffer.resize(std::max(dcb_buffer.size(), dcb_offset + dcb.size()));
++    ccb_buffer.resize(std::max(ccb_buffer.size(), ccb_offset + ccb.size()));
+ 
+-    const u32 prev_dcb_buffer_offset = queue.dcb_buffer_offset;
+-    const u32 prev_ccb_buffer_offset = queue.ccb_buffer_offset;
++    const u32 prev_dcb_buffer_offset = dcb_offset;
++    const u32 prev_ccb_buffer_offset = ccb_offset;
+     if (!dcb.empty()) {
+-        std::memcpy(queue.dcb_buffer.data() + queue.dcb_buffer_offset, dcb.data(),
+-                    dcb.size_bytes());
+-        queue.dcb_buffer_offset += dcb.size();
+-        dcb = std::span<const u32>{queue.dcb_buffer.begin() + prev_dcb_buffer_offset,
+-                                   queue.dcb_buffer.begin() + queue.dcb_buffer_offset};
++        std::memcpy(dcb_buffer.data() + dcb_offset, dcb.data(), dcb.size_bytes());
++        dcb_offset += dcb.size();
++        dcb = std::span<const u32>{dcb_buffer.begin() + prev_dcb_buffer_offset,
++                                   dcb_buffer.begin() + dcb_offset};
+     }
+ 
+     if (!ccb.empty()) {
+-        std::memcpy(queue.ccb_buffer.data() + queue.ccb_buffer_offset, ccb.data(),
+-                    ccb.size_bytes());
+-        queue.ccb_buffer_offset += ccb.size();
+-        ccb = std::span<const u32>{queue.ccb_buffer.begin() + prev_ccb_buffer_offset,
+-                                   queue.ccb_buffer.begin() + queue.ccb_buffer_offset};
++        std::memcpy(ccb_buffer.data() + ccb_offset, ccb.data(), ccb.size_bytes());
++        ccb_offset += ccb.size();
++        ccb = std::span<const u32>{ccb_buffer.begin() + prev_ccb_buffer_offset,
++                                   ccb_buffer.begin() + ccb_offset};
+     }
+ 
+     return std::make_pair(dcb, ccb);
+@@ -1226,18 +1340,24 @@ Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::sp
+ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
+     auto& queue = mapped_queues[GfxQueueId];
+ 
+-    if (EmulatorSettings.IsCopyGpuBuffers()) {
++    static const bool force_copy = std::getenv("SHAD_COPY_GPU_BUFFERS") != nullptr;
++    if (EmulatorSettings.IsCopyGpuBuffers() || force_copy) {
+         std::tie(dcb, ccb) = CopyCmdBuffers(dcb, ccb);
+     }
+ 
+     auto task = ProcessGraphics(dcb);
+     {
+         std::scoped_lock lock{submit_mutex, queue.m_access};
++        const u8 p = static_cast<u8>(OverlapSubmits() ? copy_parity : 0);
+         if (!ccb.empty()) {
+             ce_submits.emplace(ProcessCeUpdate(ccb).handle);
++            ce_parity.push(p);
++            ++pending_by_parity[p];
+             ++num_submits;
+         }
+         queue.submits.emplace(task.handle);
++        queue.submit_parity.push(p);
++        ++pending_by_parity[p];
+         ++num_submits;
+         submit_cv.notify_one();
+     }
+@@ -1252,6 +1372,7 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
+     {
+         std::scoped_lock lock{queue.m_access};
+         queue.submits.emplace(task.handle);
++        queue.submit_parity.push(0xFF); // no copy buffer involved
+     }
+ 
+     std::scoped_lock lk{submit_mutex};
+diff --git a/src/video_core/amdgpu/liverpool.h b/src/video_core/amdgpu/liverpool.h
+index 60f92db3..db4793d5 100644
+--- a/src/video_core/amdgpu/liverpool.h
++++ b/src/video_core/amdgpu/liverpool.h
+@@ -1,3 +1,5 @@
++#include <array>
++#include <cstdlib>
+ // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+@@ -72,12 +74,30 @@ public:
+     void SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb);
+     void SubmitAsc(u32 gnm_vqid, std::span<const u32> acb);
+ 
++    // Local change: with SHAD_NO_SUBMISSION_LOCK the copied command buffers are double-buffered
++    // by frame parity. SubmitDone switches to the other half and only resets it once every
++    // submit that used it (two frames ago) has been processed, allowing one frame of overlap
++    // between the game's render thread and the command processor.
++    bool OverlapSubmits() const noexcept {
++        static const bool overlap = std::getenv("SHAD_NO_SUBMISSION_LOCK") != nullptr;
++        return overlap;
++    }
++
+     void SubmitDone() noexcept {
+-        std::scoped_lock lk{submit_mutex};
+-        mapped_queues[GfxQueueId].ccb_buffer_offset = 0;
+-        mapped_queues[GfxQueueId].dcb_buffer_offset = 0;
++        std::unique_lock lk{submit_mutex};
++        auto& q = mapped_queues[GfxQueueId];
++        if (OverlapSubmits()) {
++            copy_parity ^= 1;
++            const u32 p = copy_parity;
++            submit_cv.wait(lk, [this, p] { return pending_by_parity[p] == 0; });
++            q.ccb_buffer_offset[p] = 0;
++            q.dcb_buffer_offset[p] = 0;
++        } else {
++            q.ccb_buffer_offset[0] = 0;
++            q.dcb_buffer_offset[0] = 0;
++        }
+         submit_done = true;
+-        submit_cv.notify_one();
++        submit_cv.notify_all();
+     }
+ 
+     void WaitGpuIdle() noexcept {
+@@ -123,8 +143,12 @@ public:
+         GpuQueue& gfx_queue = mapped_queues[GfxQueueId];
+         std::scoped_lock lk(gfx_queue.m_access);
+         constexpr size_t GfxReservedSize = 2_MB >> 2;
+-        gfx_queue.ccb_buffer.reserve(GfxReservedSize);
+-        gfx_queue.dcb_buffer.reserve(GfxReservedSize);
++        for (auto& b : gfx_queue.ccb_buffer) {
++            b.reserve(GfxReservedSize);
++        }
++        for (auto& b : gfx_queue.dcb_buffer) {
++            b.reserve(GfxReservedSize);
++        }
+     }
+ 
+     inline ComputeProgram& GetCsRegs() {
+@@ -199,13 +223,17 @@ private:
+ 
+     struct GpuQueue {
+         std::mutex m_access{};
+-        std::atomic<u32> dcb_buffer_offset;
+-        std::atomic<u32> ccb_buffer_offset;
+-        std::vector<u32> dcb_buffer;
+-        std::vector<u32> ccb_buffer;
++        std::array<std::atomic<u32>, 2> dcb_buffer_offset{};
++        std::array<std::atomic<u32>, 2> ccb_buffer_offset{};
++        std::array<std::vector<u32>, 2> dcb_buffer;
++        std::array<std::vector<u32>, 2> ccb_buffer;
+         std::queue<Task::Handle> submits{};
++        std::queue<u8> submit_parity{}; ///< copy-buffer half used by each queued submit
+         ComputeProgram cs_state{};
+     };
++    u32 copy_parity{0};
++    std::array<std::atomic<u32>, 2> pending_by_parity{};
++    std::queue<u8> ce_parity{};
+     std::array<GpuQueue, NumTotalQueues> mapped_queues{};
+     std::queue<Task::Handle> ce_submits;
+     u32 num_mapped_queues{1u}; // GFX is always available
+diff --git a/src/video_core/amdgpu/pm4_cmds.h b/src/video_core/amdgpu/pm4_cmds.h
+index 3092c36f..38ec43e7 100644
+--- a/src/video_core/amdgpu/pm4_cmds.h
++++ b/src/video_core/amdgpu/pm4_cmds.h
+@@ -698,6 +698,10 @@ struct PM4CmdWaitRegMem {
+ 
+     bool Test(std::span<const u32> regs) const {
+         u32 value = mem_space.Value() == MemSpace::Memory ? *Address() : regs[Reg()];
++        return TestValue(value);
++    }
++
++    bool TestValue(u32 value) const {
+         switch (function.Value()) {
+         case Function::Always: {
+             return true;
+diff --git a/src/video_core/amdgpu/regs_shader.h b/src/video_core/amdgpu/regs_shader.h
+index 38b7797d..1129d842 100644
+--- a/src/video_core/amdgpu/regs_shader.h
++++ b/src/video_core/amdgpu/regs_shader.h
+@@ -247,12 +247,21 @@ static constexpr const BinaryInfo& SearchBinaryInfo(const u32* code) {
+     UNREACHABLE_MSG("Shader binary info not found.");
+ }
+ 
+-static constexpr Shader::ShaderParams GetParams(const auto& sh) {
+-    const auto* code = sh.template Address<u32*>();
+-    const auto& bininfo = SearchBinaryInfo(code);
++// Local change: shader code is read through the unprotected backing alias when possible.
++// FIFA keeps shader binaries on pages that GPU buffers also write to, so reading them through
++// the guest mapping faults (precise readbacks) and drains the GPU on every pipeline refresh.
++const u32* ShaderCodeBacking(const u32* code, u64 size);
++
++static inline Shader::ShaderParams GetParams(const auto& sh) {
++    const auto* guest_code = sh.template Address<u32*>();
++    const u32* code = ShaderCodeBacking(guest_code, 4096);
++    const auto& bininfo = SearchBinaryInfo(code ? code : guest_code);
++    if (code) {
++        code = ShaderCodeBacking(guest_code, bininfo.length + 64);
++    }
+     return {
+         .user_data = sh.user_data,
+-        .code = std::span{code, bininfo.length / sizeof(u32)},
++        .code = std::span{code ? code : guest_code, bininfo.length / sizeof(u32)},
+         .hash = bininfo.shader_hash,
+     };
+ }
+diff --git a/src/video_core/buffer_cache/buffer_cache.cpp b/src/video_core/buffer_cache/buffer_cache.cpp
+index b20e382b..9b985aa2 100644
+--- a/src/video_core/buffer_cache/buffer_cache.cpp
++++ b/src/video_core/buffer_cache/buffer_cache.cpp
+@@ -1,3 +1,4 @@
++#include <cstdlib>
+ // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+@@ -23,6 +24,17 @@
+ 
+ namespace VideoCore {
+ 
++// Local diagnostic: SHAD_WATCH_PAGE=<hex page addr> logs every GPU-modified marking that
++// touches that 4K page (who keeps a polled label page GPU-dirty).
++static bool WatchPageHit(VAddr addr, size_t size) {
++    static const VAddr watch = [] {
++        const char* v = std::getenv("SHAD_WATCH_PAGE");
++        return v ? static_cast<VAddr>(std::strtoull(v, nullptr, 16)) & ~VAddr(0xFFF) : VAddr(0);
++    }();
++    return watch != 0 && addr < watch + 0x1000 && addr + size > watch;
++}
++
++
+ static constexpr size_t GDS_BUFFER_SIZE = 64_KB;
+ static constexpr size_t NULL_INDEX_BUFFER_SIZE = 16;
+ static constexpr size_t STREAM_BUFFER_SIZE = 128_MB;
+@@ -158,6 +170,33 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
+     }
+ }
+ 
++void BufferCache::DownloadSmallAsync(VAddr addr, u64 size) {
++    const VAddr page = addr & ~VAddr(0xFFF);
++    const VAddr end = Common::AlignUp(addr + size, 0x1000);
++    const u32 first_block = page >> block_shift;
++    const u32 last_block = (end - 1) >> block_shift;
++    const auto* arena = GetArena(first_block, last_block);
++    DownloadMemory(arena, page, end - page, true);
++    const u64 tick = scheduler.CurrentTick();
++    for (VAddr p = page; p < end; p += 0x1000) {
++        async_page_ticks[p] = tick;
++    }
++    // Close the tick right here so a CPU poll that arrives early waits only for the work up to
++    // this download, not for whatever the command processor records afterwards.
++    static const bool no_flush = std::getenv("SHAD_NO_LABEL_FLUSH") != nullptr;
++    if (!no_flush) {
++        scheduler.Flush();
++    }
++    // Experiment (SHAD_TINY_STALE=1): let the CPU read the previous value of these tiny
++    // shader-written counters without faulting; the queued download refreshes the backing
++    // bytes as soon as the GPU is done. Keeps the game's render thread from stalling on a
++    // same-frame occlusion result (lens flare) at the cost of a one-frame-old value.
++    static const bool tiny_stale = std::getenv("SHAD_NO_TINY_STALE") == nullptr; // default on
++    if (tiny_stale) {
++        memory_tracker->UnmarkRegionAsGpuModified(page, end - page, false);
++    }
++}
++
+ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size, bool async) {
+     boost::container::small_vector<vk::BufferCopy, 1> copies;
+     u64 total_size_bytes = 0;
+@@ -180,6 +219,28 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
+         gpu_modified_ranges.Subtract(address, size);
+     });
+     if (total_size_bytes == 0) {
++        // Local change: the bytes may already be in flight in an asynchronous download
++        // (DownloadSmallAsync). A synchronous request must then wait for it to land before the
++        // pages can be unprotected, otherwise the faulting read would spin forever.
++        if (!async && memory_tracker->IsRegionGpuModified(device_addr, size)) {
++            // Wait only for the tick that carries the pending download, not for everything the
++            // command processor has recorded since (it runs ahead of the GPU).
++            u64 tick = 0;
++            bool found = false;
++            for (VAddr p = device_addr & ~VAddr(0xFFF); p < device_addr + size; p += 0x1000) {
++                if (const auto it = async_page_ticks.find(p); it != async_page_ticks.end()) {
++                    tick = std::max(tick, it->second);
++                    found = true;
++                }
++            }
++            if (found) {
++                scheduler.Wait(tick);
++            } else {
++                scheduler.Finish();
++            }
++            scheduler.PopPendingOperations();
++            memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
++        }
+         return;
+     }
+     const auto download =
+@@ -217,6 +278,10 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
+     const bool is_written = True(flags & ObtainBufferFlags::IsWritten);
+     const bool is_texel_buffer = True(flags & ObtainBufferFlags::IsTexelBuffer);
+     const bool skip_stream_buffer = True(flags & ObtainBufferFlags::IgnoreStreamBuffer);
++    if (is_written && WatchPageHit(device_addr, size)) {
++        LOG_INFO(Render, "WATCH obtain-written addr={:#x} size={} texel={}", device_addr, size,
++                 is_texel_buffer);
++    }
+     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
+     if (!is_written && !skip_stream_buffer && size <= STREAM_THRESHOLD &&
+         !IsRegionGpuModified(device_addr, size)) {
+@@ -259,11 +324,18 @@ bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
+ }
+ 
+ void BufferCache::MarkRegionAsGpuModified(VAddr addr, size_t size) {
++    if (WatchPageHit(addr, size)) {
++        LOG_INFO(Render, "WATCH gpu-modified addr={:#x} size={}", addr, size);
++    }
+     texture_cache.MarkAsMaybeGpuDirty(addr, size);
+     memory_tracker->MarkRegionAsGpuModified(addr, size);
+     gpu_modified_ranges.Add(addr, size);
+ }
+ 
++void BufferCache::MarkRegionForCpuReadback(VAddr addr, size_t size) {
++    memory_tracker->MarkRegionAsGpuModified(addr, size);
++}
++
+ void BufferCache::ReadEdgeImagePages(const Image& image) {
+     // May happen that after downloading the image and invalidating region,
+     // that there were GPU modified ranges that are lost due to CPU reuploading.
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index a3ba3cb7..3d41ab2d 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -3,6 +3,8 @@
+ 
+ #pragma once
+ 
++#include <absl/container/flat_hash_map.h>
++
+ #include <deque>
+ #include <boost/container/small_vector.hpp>
+ 
+@@ -98,6 +100,10 @@ public:
+     void UnmarkRegionAsGpuModified(VAddr device_addr, u64 size, bool is_write = false);
+ 
+     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
++    /// Local change: queue an asynchronous download of the GPU-modified bytes in the page(s)
++    /// of a tiny GPU write (label/fence), so the page becomes CPU-readable without a drain.
++    void DownloadSmallAsync(VAddr addr, u64 size);
++
+     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false, bool async = false,
+                     bool assume_locks = false);
+ 
+@@ -119,6 +125,8 @@ public:
+ 
+     /// Mark region as modified from the GPU
+     void MarkRegionAsGpuModified(VAddr addr, size_t size);
++    /// Local change: protect a region so a CPU read faults, without adding a buffer download range.
++    void MarkRegionForCpuReadback(VAddr addr, size_t size);
+ 
+     /// Synchronizes all buffers needed for DMA.
+     void SynchronizeDmaBuffers();
+@@ -159,6 +167,7 @@ private:
+     Core::MemoryManager* memory;
+     TextureCache& texture_cache;
+     std::unique_ptr<MemoryTracker> memory_tracker;
++    absl::flat_hash_map<VAddr, u64> async_page_ticks; ///< page -> tick of pending DownloadSmallAsync
+ 
+     StreamBuffer stream_buffer;
+     Buffer gds_buffer;
+diff --git a/src/video_core/cache_storage.cpp b/src/video_core/cache_storage.cpp
+index a403e85a..27efbb58 100644
+--- a/src/video_core/cache_storage.cpp
++++ b/src/video_core/cache_storage.cpp
+@@ -1,3 +1,4 @@
++#include <ctime>
+ // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+@@ -120,6 +121,20 @@ void DataBase::Open() {
+     opened = true;
+ }
+ 
++void DataBase::RetireAndReopen() {
++    const auto stale = cache_path;
++    Close();
++    if (!EmulatorSettings.IsPipelineCacheArchived() && std::filesystem::exists(stale)) {
++        auto retired = stale;
++        retired += ".stale-" + std::to_string(std::time(nullptr));
++        std::error_code ec;
++        std::filesystem::rename(stale, retired, ec);
++        LOG_WARNING(Render, "Incompatible pipeline cache moved to {}; starting a fresh one",
++                    retired.string());
++    }
++    Open();
++}
++
+ void DataBase::Close() {
+     if (!IsOpened()) {
+         return;
+diff --git a/src/video_core/cache_storage.h b/src/video_core/cache_storage.h
+index 91f2136e..5f382fa4 100644
+--- a/src/video_core/cache_storage.h
++++ b/src/video_core/cache_storage.h
+@@ -28,6 +28,8 @@ public:
+ 
+     void Open();
+     void Close();
++    // Local change: move an incompatible cache aside and start a fresh, writable one.
++    void RetireAndReopen();
+     [[nodiscard]] bool IsOpened() const {
+         return opened;
+     }
+diff --git a/src/video_core/page_manager.cpp b/src/video_core/page_manager.cpp
+index c8e463cf..0cdd0702 100644
+--- a/src/video_core/page_manager.cpp
++++ b/src/video_core/page_manager.cpp
+@@ -115,7 +115,7 @@ struct PageManager::Impl {
+         locks.reserve(start_page, end_page);
+     }
+ 
+-    void UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op) {
++    void UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op, bool is_read = false) {
+         const u64 page_start = addr >> PM_PAGE_BITS;
+         const u64 page_end = Common::DivCeil(addr + size, PM_PAGE_SIZE);
+ 
+@@ -156,7 +156,8 @@ struct PageManager::Impl {
+             }
+ 
+             // Apply the change to the page state
+-            const auto new_perms = state->Update(write_op);
++            const auto new_perms = is_read ? state->Update(PageOp::None, false, write_op, true)
++                                            : state->Update(write_op);
+             if (new_perms != perms) [[unlikely]] {
+                 // If the protection changed add pending (un)protect action
+                 release_pending();
+@@ -426,8 +427,12 @@ struct SignalImpl : public PageManager::Impl {
+         RENDERER_TRACE;
+         auto* memory = Core::Memory::Instance();
+         auto& impl = memory->GetAddressSpace();
+-        ASSERT_MSG(perms != Core::MemoryPermission::Write,
+-                   "Attempted to protect region as write-only which is not a valid permission");
++        // Local change: a region with only a read watcher (image awaiting a CPU readback) would
++        // need write-only protection, which does not exist. Block both; a write fault is
++        // handled by InvalidateMemory like any other CPU write.
++        if (perms == Core::MemoryPermission::Write) {
++            perms = Core::MemoryPermission::None;
++        }
+         impl.Protect(address, size, perms);
+     }
+ 
+@@ -475,6 +480,10 @@ void PageManager::UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op) cons
+     impl->UpdatePageWatchers(addr, size, write_op);
+ }
+ 
++void PageManager::UpdateReadWatchers(VAddr addr, u64 size, PageOp read_op) const {
++    impl->UpdatePageWatchers(addr, size, read_op, true);
++}
++
+ void PageManager::UpdatePageWatchersForRegion(VAddr base_addr, const Bounds& bounds,
+                                               const RegionBits& write_mask,
+                                               const RegionBits& read_mask, PageOp write_op,
+diff --git a/src/video_core/page_manager.h b/src/video_core/page_manager.h
+index f24c601b..c3fd207a 100644
+--- a/src/video_core/page_manager.h
++++ b/src/video_core/page_manager.h
+@@ -41,6 +41,9 @@ public:
+     /// Updates watches in the pages touching the specified region.
+     void UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op) const;
+ 
++    /// Local change: adds/removes a READ watcher on the pages of a region (CPU reads then fault).
++    void UpdateReadWatchers(VAddr addr, u64 size, PageOp read_op) const;
++
+     /// Updates watches in the pages touching the inclusive bounds using a mask.
+     void UpdatePageWatchersForRegion(VAddr base_addr, const Bounds& bounds,
+                                      const RegionBits& write_mask, const RegionBits& read_mask,
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp b/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
+index 0488ddbb..6be6c03e 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
+@@ -320,11 +320,21 @@ void PipelineCache::WarmUp() {
+                                            std::move(profile_data));
+         return;
+     }
++    // Local change: an incompatible cache is retired and replaced instead of being ignored,
++    // otherwise the emulator runs without any cache forever (every session recompiles).
++    const auto start_fresh = [&] {
++        Storage::DataBase::Instance().RetireAndReopen();
++        Storage::DataBase::Instance().FinishPreload();
++        std::vector<u8> fresh(sizeof(profile));
++        std::memcpy(fresh.data(), &profile, sizeof(profile));
++        Storage::DataBase::Instance().Save(Storage::BlobType::ShaderProfile, "profile",
++                                           std::move(fresh));
++    };
+     if (profile_data.size() != sizeof(Shader::Profile)) {
+         LOG_WARNING(Render,
+-                    "Pipeline cache profile has unexpected size ({} != {}). Ignoring the cache",
++                    "Pipeline cache profile has unexpected size ({} != {}). Replacing the cache",
+                     profile_data.size(), sizeof(Shader::Profile));
+-        Storage::DataBase::Instance().Close();
++        start_fresh();
+         return;
+     }
+ 
+@@ -332,8 +342,8 @@ void PipelineCache::WarmUp() {
+     std::memcpy(&cached_profile, profile_data.data(), sizeof(cached_profile));
+     if (cached_profile != profile) {
+         LOG_WARNING(Render,
+-                    "Pipeline cache isn't compatible with current system. Ignoring the cache");
+-        Storage::DataBase::Instance().Close();
++                    "Pipeline cache isn't compatible with current system. Replacing the cache");
++        start_fresh();
+         return;
+     }
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 88ab4fc6..38ab9732 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -1,3 +1,6 @@
++#include <execinfo.h>
++#include <atomic>
++#include <cstdlib>
+ // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+@@ -232,6 +235,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
+     DebugState.IncDrawCall();
+ 
+     ResetBindings(false);
++    FlushTinyWritten();
+ }
+ 
+ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 stride,
+@@ -314,6 +318,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
+     }
+ 
+     ResetBindings(false);
++    FlushTinyWritten();
+ }
+ 
+ void Rasterizer::DispatchDirect() {
+@@ -349,6 +354,7 @@ void Rasterizer::DispatchDirect() {
+     DebugState.IncDispatch();
+ 
+     ResetBindings(true);
++    FlushTinyWritten();
+ }
+ 
+ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
+@@ -383,6 +389,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
+     DebugState.IncDispatch();
+ 
+     ResetBindings(true);
++    FlushTinyWritten();
+ }
+ 
+ u64 Rasterizer::Flush() {
+@@ -397,6 +404,7 @@ void Rasterizer::Finish() {
+ }
+ 
+ void Rasterizer::OnSubmit() {
++    FlushTinyWritten();
+     buffer_cache.TickFrame();
+     texture_cache.ProcessDownloadImages();
+     texture_cache.RunGarbageCollector();
+@@ -404,9 +412,35 @@ void Rasterizer::OnSubmit() {
+ }
+ 
+ void Rasterizer::OnFence() {
++    FlushTinyWritten();
+     texture_cache.ProcessDownloadImages();
+ }
+ 
++void Rasterizer::NoteTinyWritten(VAddr addr, u64 size) {
++    static const bool no_async = std::getenv("SHAD_NO_ASYNC_LABELS") != nullptr;
++    if (no_async) {
++        return;
++    }
++    for (const auto& [a, s] : tiny_written) {
++        if (a == addr) {
++            return;
++        }
++    }
++    if (tiny_written.size() < 64) {
++        tiny_written.emplace_back(addr, size);
++    }
++}
++
++void Rasterizer::FlushTinyWritten() {
++    if (tiny_written.empty()) {
++        return;
++    }
++    for (const auto& [addr, size] : tiny_written) {
++        buffer_cache.DownloadSmallAsync(addr, size);
++    }
++    tiny_written.clear();
++}
++
+ bool Rasterizer::BindResources(const Pipeline* pipeline) {
+     if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
+         IsComputeImageClear(pipeline)) {
+@@ -822,6 +856,12 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
+                 VideoCore::ObtainBufferFlags flags = {};
+                 if (desc.is_written) {
+                     flags |= VideoCore::ObtainBufferFlags::IsWritten;
++                    // Local change: a tiny shader-written buffer is a counter/label the CPU
++                    // polls (FIFA: 3 x 8 bytes per frame). Remember it and queue an async
++                    // download at the next fence so the poll does not fault and drain the GPU.
++                    if (size <= 64) {
++                        NoteTinyWritten(vsharp.base_address, size);
++                    }
+                 }
+                 if (desc.is_formatted) {
+                     flags |= VideoCore::ObtainBufferFlags::IsTexelBuffer;
+@@ -1203,6 +1243,10 @@ void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
+ }
+ 
+ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds) {
++    static const bool log_readbacks = std::getenv("SHAD_LOG_GPUWRITES") != nullptr;
++    if (log_readbacks && !is_gds) {
++        LOG_INFO(Render, "GPUWRITE fill addr={:#x} size={}", address, num_bytes);
++    }
+     ASSERT_MSG(address % 4 == 0 && num_bytes % 4 == 0,
+                "FillBuffer address and size must be a multiple of 4 bytes");
+     if (!is_gds) {
+@@ -1221,9 +1265,19 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
+                                          VideoCore::ObtainBufferFlags::IsWritten);
+     }();
+     runtime.FillBuffer(buffer, offset, num_bytes, value);
++    if (!is_gds && num_bytes <= 64) {
++        static const bool no_async = std::getenv("SHAD_NO_ASYNC_LABELS") != nullptr;
++        if (!no_async) {
++            buffer_cache.DownloadSmallAsync(address, num_bytes);
++        }
++    }
+ }
+ 
+ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
++    static const bool log_readbacks = std::getenv("SHAD_LOG_GPUWRITES") != nullptr;
++    if (log_readbacks && !dst_gds) {
++        LOG_INFO(Render, "GPUWRITE copy dst={:#x} size={} src_gds={}", dst, num_bytes, src_gds);
++    }
+     if (!dst_gds && !buffer_cache.IsRegionGpuModified(dst, num_bytes)) {
+         if (!src_gds && !buffer_cache.IsRegionGpuModified(src, num_bytes) &&
+             !texture_cache.FindImageFromRange(src, num_bytes)) {
+@@ -1255,6 +1309,12 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
+         .size = num_bytes,
+     };
+     runtime.CopyBuffer(src_buffer, dst_buffer, std::span{&copy, 1});
++    if (!dst_gds && num_bytes <= 64) {
++        static const bool no_async = std::getenv("SHAD_NO_ASYNC_LABELS") != nullptr;
++        if (!no_async) {
++            buffer_cache.DownloadSmallAsync(dst, num_bytes);
++        }
++    }
+ }
+ 
+ u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {
+@@ -1269,6 +1329,20 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
+         // Not GPU mapped memory, can skip invalidation logic entirely.
+         return false;
+     }
++    // Local change: a CPU write into a page of an image that still awaits its on-demand
++    // readback must not discard that readback (the game writes next to / into composites it
++    // later reads back: kit and face textures came out wrong). Download first, then invalidate.
++    static const bool keep_pending = std::getenv("SHAD_DROP_PENDING_ON_WRITE") == nullptr;
++    if (keep_pending) {
++        const auto image_flush = [this, addr, size] {
++            texture_cache.DownloadImagesForCpuRead(addr, size);
++        };
++        if (assume_locks) {
++            image_flush();
++        } else {
++            liverpool->SendCommand<true>(image_flush);
++        }
++    }
+     buffer_cache.InvalidateMemory(addr, size, assume_locks);
+     texture_cache.InvalidateMemory(addr, size);
+     return true;
+@@ -1279,6 +1353,34 @@ bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {
+         // Not GPU mapped memory, can skip invalidation logic entirely.
+         return false;
+     }
++    // Local diagnostic: SHAD_LOG_READBACKS=1 logs every CPU read fault on GPU-written memory
++    // (address, size, GPU thread or not) so the per-frame readback hot spots can be found.
++    static const bool log_readbacks = std::getenv("SHAD_LOG_READBACKS") != nullptr;
++    if (log_readbacks) {
++        LOG_INFO(Render, "READBACK addr={:#x} size={} gpu_thread={}", addr, size, assume_locks);
++        // GPU-thread read faults: dump a raw backtrace for the first few and then every 500th,
++        // symbolicated offline against the binary's symbol table.
++        static std::atomic<u32> gpu_faults{0};
++        if (assume_locks) {
++            const u32 n = gpu_faults.fetch_add(1);
++            if (n < 8 || n % 500 == 0) {
++                void* frames[24];
++                const int count = backtrace(frames, 24);
++                std::string bt;
++                for (int i = 0; i < count; ++i) {
++                    bt += fmt::format("{:#x} ", reinterpret_cast<uintptr_t>(frames[i]));
++                }
++                LOG_INFO(Render, "READBACK-BT n={} {}", n, bt);
++            }
++        }
++    }
++    // Local change: GPU-written tiled images are downloaded on the first CPU read.
++    const auto image_flush = [this, addr, size] { texture_cache.DownloadImagesForCpuRead(addr, size); };
++    if (assume_locks) {
++        image_flush();
++    } else {
++        liverpool->SendCommand<true>(image_flush);
++    }
+     buffer_cache.ReadMemory(addr, size, false, false, assume_locks);
+     return true;
+ }
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index e01715c5..242b88f1 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -3,6 +3,8 @@
+ 
+ #pragma once
+ 
++#include <boost/container/small_vector.hpp>
++
+ #include "common/recursive_lock.h"
+ #include "common/shared_first_mutex.h"
+ #include "video_core/buffer_cache/buffer_cache.h"
+@@ -75,6 +77,11 @@ public:
+     bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false);
+     bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
+     bool IsMapped(VAddr addr, u64 size);
++    void NoteTinyWritten(VAddr addr, u64 size);
++    void FlushTinyWritten();
++    bool IsRegionGpuModified(VAddr addr, u64 size) {
++        return buffer_cache.IsRegionGpuModified(addr, size);
++    }
+     void MapMemory(VAddr addr, u64 size);
+     void RegisterMemory(VAddr addr, u64 size);
+     void UnmapMemory(VAddr addr, u64 size);
+@@ -139,6 +146,7 @@ private:
+     Scheduler& scheduler;
+     Runtime& runtime;
+     VideoCore::PageManager page_manager;
++    boost::container::small_vector<std::pair<VAddr, u64>, 8> tiny_written;
+     VideoCore::BufferCache buffer_cache;
+     VideoCore::TextureCache texture_cache;
+     AmdGpu::Liverpool* liverpool;
+diff --git a/src/video_core/texture_cache/image_info.cpp b/src/video_core/texture_cache/image_info.cpp
+index 5b99e73b..b6df5527 100644
+--- a/src/video_core/texture_cache/image_info.cpp
++++ b/src/video_core/texture_cache/image_info.cpp
+@@ -1,6 +1,7 @@
+ // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <cstdlib>
+ #include "common/assert.h"
+ #include "core/libraries/kernel/process.h"
+ #include "core/libraries/videoout/buffer.h"
+@@ -164,6 +165,15 @@ ImageInfo::ImageInfo(const AmdGpu::Image& sharp, const Shader::ImageResource& de
+     size.depth = props.is_volume ? image.depth + 1 : 1;
+     pitch = image.Pitch();
+     resources.levels = image.NumLevels();
++    {
++        // Diagnostic experiment (local): SHAD_HUD_MIP0=1 limits tiled, non-block images whose
++        // pitch differs from their width to a single mip level.
++        static const bool hud_mip0 = std::getenv("SHAD_HUD_MIP0") != nullptr;
++        if (hud_mip0 && props.is_tiled && !props.is_block && resources.levels > 1 &&
++            pitch != size.width) {
++            resources.levels = 1;
++        }
++    }
+     resources.layers = image.NumLayers();
+     num_samples = image.NumSamples();
+     num_bits = NumBitsPerBlock(data_fmt);
+diff --git a/src/video_core/texture_cache/image_view.cpp b/src/video_core/texture_cache/image_view.cpp
+index 95daedd2..8fc79b22 100644
+--- a/src/video_core/texture_cache/image_view.cpp
++++ b/src/video_core/texture_cache/image_view.cpp
+@@ -1,3 +1,4 @@
++#include <cstdlib>
+ // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+@@ -65,6 +66,16 @@ ImageViewInfo::ImageViewInfo(const AmdGpu::Image& image, const Shader::ImageReso
+     range.base.layer = std::min<u32>(image.base_array, image.NumLayers() - 1);
+     range.extent.levels = image.NumViewLevels(desc.is_array);
+     range.extent.layers = image.NumViewLayers(desc.is_array);
++    {
++        // Diagnostic experiment (local, must match ImageInfo): SHAD_HUD_MIP0=1 limits tiled,
++        // non-block images whose pitch differs from their width to a single mip level.
++        static const bool hud_mip0 = std::getenv("SHAD_HUD_MIP0") != nullptr;
++        if (hud_mip0 && image.IsTiled() && !AmdGpu::IsBlockCoded(dfmt) &&
++            image.NumLevels() > 1 && image.Pitch() != image.width + 1) {
++            range.base.level = 0;
++            range.extent.levels = 1;
++        }
++    }
+     type = image.GetViewType(desc.is_array);
+     min_lod = static_cast<u32>(image.min_lod);
+     if (!is_storage) {
+diff --git a/src/video_core/texture_cache/texture_cache.cpp b/src/video_core/texture_cache/texture_cache.cpp
+index 35e6ba66..03ad2b22 100644
+--- a/src/video_core/texture_cache/texture_cache.cpp
++++ b/src/video_core/texture_cache/texture_cache.cpp
+@@ -2,6 +2,8 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include <cstdlib>
++#include <unordered_set>
+ #include <limits>
+ #include <xxhash.h>
+ 
+@@ -188,6 +190,12 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
+     ForEachImageInRegion(pages_start, pages_end - pages_start,
+                          [&](ImageId image_id, Image&) { image_ids.push_back(image_id); });
+ 
++    for (const auto image_id : image_ids) {
++        // Local change: a CPU write into an image awaiting an on-demand readback ends the
++        // readback and lifts the read protection, otherwise the write faults forever.
++        ForgetOndemandImage(image_id);
++    }
++
+     for (const auto image_id : image_ids) {
+         Image& image = slot_images[image_id];
+         std::scoped_lock lk{image.mutex};
+@@ -704,14 +712,178 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
+     return {};
+ }
+ 
++// Local change: SHAD_READBACK_TILED=<max pixels> also queues GPU-written *tiled* images for
++// readback to guest memory. FIFA composites player kit/skin textures with the GPU into tiled
++// textures that the CPU then reads; without the readback the CPU sees stale memory and the
++// close-up player models (kit selection, warm-up) render white or as noise. The download path
++// already handles tiling via TileManager; upstream only enables it for linear images.
++static u64 ReadbackTiledMaxPixels() {
++    static const u64 value = [] {
++        const char* env = std::getenv("SHAD_READBACK_TILED");
++        if (!env || !*env) {
++            return u64{0};
++        }
++        const u64 v = std::strtoull(env, nullptr, 10);
++        // Default 256x256: the CPU-read composites are 32x8..128x128. Larger GPU-only images
++        // (render targets, shadow maps) must not be written back: by the time the deferred
++        // write lands the game may have reused that memory, e.g. for a thread stack.
++        return v == 0 || v == 1 ? u64{256 * 256} : v;
++    }();
++    return value;
++}
++
++static bool ShouldReadbackImage(const Image& image) {
++    if (!image.info.props.is_tiled || image.info.size.width <= 8) {
++        return true;
++    }
++    static const bool log_images = std::getenv("SHAD_LOG_IMAGES") != nullptr;
++    const u32 w = image.info.size.width, h = image.info.size.height;
++    const u64 pixels = u64{w} * h;
++    bool ok = pixels <= ReadbackTiledMaxPixels();
++    // Exclude what is clearly a frame-sized render target or an HDR/depth/shadow buffer; the
++    // CPU never reads those back and each would cost a full download per frame.
++    switch (image.info.pixel_format) {
++    case vk::Format::eB10G11R11UfloatPack32:
++    case vk::Format::eR16G16B16A16Sfloat:
++    case vk::Format::eR32Sfloat:
++    case vk::Format::eD32Sfloat:
++    case vk::Format::eD32SfloatS8Uint:
++    case vk::Format::eD16Unorm:
++    case vk::Format::eD24UnormS8Uint:
++        ok = false;
++        break;
++    default:
++        break;
++    }
++    if (w == 1920 || w == 1280 || w == 960 || h == 1080 || h == 720 || h == 540) {
++        ok = false;
++    }
++    if (log_images) {
++        static std::unordered_set<u64> seen;
++        const u64 key = (image.info.guest_address * 1000003ULL) ^ (u64{w} << 32) ^ h;
++        if (seen.insert(key).second) {
++            LOG_INFO(Render_Vulkan, "TILEDRB {} addr={:#x} fmt={} {}x{} mips={}", ok ? "accept" : "reject",
++                     image.info.guest_address, vk::to_string(image.info.pixel_format), w, h,
++                     image.info.resources.levels);
++        }
++    }
++    return ok;
++}
++
++// Local change: tiled images are not read back eagerly after every GPU write (a 4096x4096 mask
++// written per frame costs a GPU stall each time). Instead the region is protected so the first
++// CPU read faults, and the download happens then (DownloadImagesForCpuRead). Set
++// SHAD_READBACK_EAGER=1 to restore the eager behaviour for tiled images too.
++void TextureCache::QueueReadback(ImageId image_id, Image& image) {
++    static const bool eager = std::getenv("SHAD_READBACK_EAGER") != nullptr;
++    std::unique_lock lk{download_images_mutex};
++    // Default on: every GPU-written image is read back on demand (first CPU read fault).
++    // SHAD_READBACK_EAGER_LINEAR=1 restores eager downloads of linear/tiny images.
++    static const bool all_ondemand = std::getenv("SHAD_READBACK_EAGER_LINEAR") == nullptr;
++    if (eager || (!all_ondemand && (!image.info.props.is_tiled || image.info.size.width <= 8))) {
++        static const bool log_images = std::getenv("SHAD_LOG_IMAGES") != nullptr;
++        if (log_images) {
++            LOG_INFO(Render_Vulkan, "EAGER download addr={:#x} {}x{} fmt={} tiled={}",
++                     image.info.guest_address, image.info.size.width, image.info.size.height,
++                     vk::to_string(image.info.pixel_format), static_cast<bool>(image.info.props.is_tiled));
++        }
++        download_images.emplace(image_id);
++        return;
++    }
++    if (!ondemand_images.insert(image_id).second) {
++        return; // already protected and pending
++    }
++    static const bool log_images = std::getenv("SHAD_LOG_IMAGES") != nullptr;
++    if (log_images) {
++        LOG_INFO(Render_Vulkan, "ONDEMAND protect addr={:#x} {}x{} fmt={}", image.info.guest_address,
++                 image.info.size.width, image.info.size.height, vk::to_string(image.info.pixel_format));
++    }
++    ProtectForCpuRead(image.info.guest_address, image.info.guest_size, true);
++}
++
++// Precise readbacks: reuse the buffer cache's GPU-modified tracking (it protects reads).
++// Relaxed/Disabled: that tracking never protects reads, so add our own read watchers on the
++// pages, refcounted per page so two images sharing a page do not double-track.
++void TextureCache::ProtectForCpuRead(VAddr addr, size_t size, bool protect) {
++    if (EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::Precise) {
++        if (protect) {
++            buffer_cache.MarkRegionForCpuReadback(addr, size);
++        } else {
++            buffer_cache.UnmarkRegionAsGpuModified(addr, size, true);
++        }
++        return;
++    }
++    const VAddr first = PageManager::GetPageAddr(addr);
++    const VAddr last = PageManager::GetNextPageAddr(addr + size - 1);
++    for (VAddr page = first; page < last; page += 4096) {
++        auto& refs = ondemand_page_refs[page];
++        if (protect) {
++            if (refs++ == 0) {
++                page_manager.UpdateReadWatchers(page, 4096, PageOp::Track);
++            }
++        } else if (refs > 0) {
++            if (--refs == 0) {
++                page_manager.UpdateReadWatchers(page, 4096, PageOp::Untrack);
++                ondemand_page_refs.erase(page);
++            }
++        }
++    }
++}
++
++void TextureCache::DownloadImagesForCpuRead(VAddr addr, size_t size) {
++    boost::container::small_vector<std::pair<ImageId, bool>, 4> ids;
++    {
++        std::unique_lock lk{download_images_mutex};
++        if (ondemand_images.empty()) {
++            return;
++        }
++        // Protection is per page, so a fault on a page shared with an image must resolve the
++        // image even if the accessed bytes lie outside it (e.g. shader code next to a texture).
++        const auto pages_start = PageManager::GetPageAddr(addr);
++        const auto pages_end = PageManager::GetNextPageAddr(addr + size - 1);
++        ForEachImageInRegion(pages_start, pages_end - pages_start, [&](ImageId image_id, Image& image) {
++            if (ondemand_images.contains(image_id)) {
++                ids.emplace_back(image_id, True(image.flags & ImageFlagBits::GpuModified));
++            }
++        });
++        for (const auto& [id, _] : ids) {
++            ondemand_images.erase(id);
++        }
++    }
++    for (const auto& [id, modified] : ids) {
++        static const bool log_images = std::getenv("SHAD_LOG_IMAGES") != nullptr;
++        if (log_images) {
++            const auto& im = slot_images[id];
++            LOG_INFO(Render_Vulkan, "ONDEMAND download addr={:#x} {}x{} fmt={} modified={}",
++                     im.info.guest_address, im.info.size.width, im.info.size.height,
++                     vk::to_string(im.info.pixel_format), modified);
++        }
++        if (modified) {
++            DownloadImageMemory(id, DownloadMemoryFlags::Sync | DownloadMemoryFlags::DiscardBufferCache);
++        }
++        // Always lift the read protection of the whole image, so a page that the download
++        // did not cover (e.g. mip tail) cannot fault forever.
++        const auto& image = slot_images[id];
++        std::unique_lock lk{download_images_mutex};
++        ProtectForCpuRead(image.info.guest_address, image.info.guest_size, false);
++    }
++}
++
++void TextureCache::ForgetOndemandImage(ImageId image_id) {
++    std::unique_lock lk{download_images_mutex};
++    if (ondemand_images.erase(image_id)) {
++        const auto& image = slot_images[image_id];
++        ProtectForCpuRead(image.info.guest_address, image.info.guest_size, false);
++    }
++}
++
+ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
+     Image& image = slot_images[image_id];
+     if (desc.type == BindingType::Storage) {
+         image.flags |= ImageFlagBits::GpuModified;
+-        if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
++        if (readback_linear_images && ShouldReadbackImage(image) &&
+             image.info.guest_address != 0) {
+-            std::unique_lock lk{download_images_mutex};
+-            download_images.emplace(image_id);
++            QueueReadback(image_id, image);
+         }
+     }
+     UpdateImage(image_id);
+@@ -746,9 +918,8 @@ void TextureCache::UnregisterMeta(VAddr address, u64 owner_uid) {
+ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& desc) {
+     Image& image = slot_images[image_id];
+     image.flags |= ImageFlagBits::GpuModified;
+-    if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8)) {
+-        std::unique_lock lk{download_images_mutex};
+-        download_images.emplace(image_id);
++    if (readback_linear_images && ShouldReadbackImage(image)) {
++        QueueReadback(image_id, image);
+     }
+     image.usage.render_target = 1u;
+     UpdateImage(image_id);
+@@ -841,6 +1012,24 @@ void TextureCache::AssociateStencil(ImageId depth_id, const ImageInfo& depth_inf
+ }
+ 
+ void TextureCache::RefreshImage(Image& image) {
++    static const bool log_images = std::getenv("SHAD_LOG_IMAGES") != nullptr;
++    if (log_images) {
++        const auto& i = image.info;
++        static std::unordered_set<u64> seen;
++        const u64 key = (i.guest_address * 1000003ULL) ^ (static_cast<u64>(i.pixel_format) << 48) ^
++                        (static_cast<u64>(i.size.width) << 32) ^ (static_cast<u64>(i.size.height) << 16) ^
++                        i.resources.levels;
++        if (seen.insert(key).second) {
++        LOG_INFO(Render_Vulkan,
++                 "IMGUP addr={:#x} fmt={} {}x{}x{} mips={} layers={} pitch={} bits={} tile={} "
++                 "array={} tiled={} block={} pow2={} guest_size={:#x}",
++                 i.guest_address, vk::to_string(i.pixel_format), i.size.width, i.size.height,
++                 i.size.depth, i.resources.levels, i.resources.layers, i.pitch, i.num_bits,
++                 static_cast<int>(i.tile_mode), static_cast<int>(i.array_mode),
++                 static_cast<u32>(i.props.is_tiled), static_cast<u32>(i.props.is_block),
++                 static_cast<u32>(i.props.is_pow2), i.guest_size);
++        }
++    }
+     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
+         return;
+     }
+@@ -1229,6 +1418,7 @@ void TextureCache::TouchImage(Image& image) {
+ }
+ 
+ void TextureCache::DeleteImage(ImageId image_id) {
++    ForgetOndemandImage(image_id);
+     Image& image = slot_images[image_id];
+     ASSERT_MSG(image.IsUntracked(), "Image was not untracked");
+     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered), "Image was not unregistered");
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 54253b4d..7a1286f8 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -120,6 +120,12 @@ public:
+     /// Invalidates any image in the logical page range.
+     void InvalidateMemory(VAddr addr, size_t size);
+ 
++    /// Local change: download GPU-written images overlapping a region the CPU is reading now.
++    void DownloadImagesForCpuRead(VAddr addr, size_t size);
++    void QueueReadback(ImageId image_id, Image& image);
++    void ForgetOndemandImage(ImageId image_id);
++    void ProtectForCpuRead(VAddr addr, size_t size, bool protect);
++
+     /// Marks an image as dirty if it exists at the provided address.
+     void InvalidateMemoryFromGPU(VAddr address, size_t max_size);
+ 
+@@ -412,6 +418,8 @@ private:
+     TileManager tile_manager;
+     absl::flat_hash_map<u64, SamplerId> samplers;
+     absl::flat_hash_set<ImageId> download_images;
++    absl::flat_hash_set<ImageId> ondemand_images; ///< tiled images awaiting a CPU read fault
++    absl::flat_hash_map<VAddr, u32> ondemand_page_refs; ///< read-watcher refcount per page (relaxed mode)
+     u64 total_used_memory = 0;
+     u64 trigger_gc_memory = 0;
+     u64 pressure_gc_memory = 0;

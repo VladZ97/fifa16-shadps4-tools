@@ -1,0 +1,7 @@
+- [FIFA 16 on shadPS4 Mac setup](fifa16-shadps4-mac-setup.md) — M1 Pro, Rosetta, KosmicKrisp, update overlay installed 2026-10-27, EnsureResident suspect
+- [Verify before measuring](feedback-verify-before-measuring.md) — check the screenshot/parsed values on run 1 before batching
+- [FIFA 16 Metal hybrid side project](fifa16-metal-hybrid-project.md) — ~/fifa_metal, bbgpu dylib bridge into shadPS4, first light 2026-10-29, how to build/run
+- [Judge runs early](feedback-judge-runs-early.md) — drives auto-abort with VERDICT (VISUAL_BAD/STALL) vs perf refs; read BAD_*.jpg; sandbox off
+- [No lldb on x86 shadps4](feedback-no-lldb-rosetta.md) — wedged Rosetta oahd; use SHAD_FAULT_DIAG instead
+- [fifamod mod manager](fifamod-mod-manager.md) — ~/FIFA16Mods, one folder per mod on SSD, merged symlink overlay; never run fip_overlay.sh again; exFAT caveats
+- [pes2fifa stadium converter](pes2fifa-stadium-converter.md) — PES 2021 stadium folder -> FIFA 16 mod; Camp Nou = id 6; reflection not rotation; how to test in game

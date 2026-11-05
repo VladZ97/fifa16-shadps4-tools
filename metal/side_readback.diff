@@ -1,0 +1,1378 @@
+diff --git a/src/video_core/buffer_cache/buffer_cache.cpp b/src/video_core/buffer_cache/buffer_cache.cpp
+index b20e382b..c0b3565f 100644
+--- a/src/video_core/buffer_cache/buffer_cache.cpp
++++ b/src/video_core/buffer_cache/buffer_cache.cpp
+@@ -1,3 +1,4 @@
++#include <cstdlib>
+ // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+@@ -23,6 +24,17 @@
+ 
+ namespace VideoCore {
+ 
++// Local diagnostic: SHAD_WATCH_PAGE=<hex page addr> logs every GPU-modified marking that
++// touches that 4K page (who keeps a polled label page GPU-dirty).
++static bool WatchPageHit(VAddr addr, size_t size) {
++    static const VAddr watch = [] {
++        const char* v = std::getenv("SHAD_WATCH_PAGE");
++        return v ? static_cast<VAddr>(std::strtoull(v, nullptr, 16)) & ~VAddr(0xFFF) : VAddr(0);
++    }();
++    return watch != 0 && addr < watch + 0x1000 && addr + size > watch;
++}
++
++
+ static constexpr size_t GDS_BUFFER_SIZE = 64_KB;
+ static constexpr size_t NULL_INDEX_BUFFER_SIZE = 16;
+ static constexpr size_t STREAM_BUFFER_SIZE = 128_MB;
+@@ -158,6 +170,39 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
+     }
+ }
+ 
++void BufferCache::DownloadSmallAsync(VAddr addr, u64 size) {
++    const VAddr page = addr & ~VAddr(0xFFF);
++    const VAddr end = Common::AlignUp(addr + size, 0x1000);
++    const u32 first_block = page >> block_shift;
++    const u32 last_block = (end - 1) >> block_shift;
++    const auto* arena = GetArena(first_block, last_block);
++    DownloadMemory(arena, page, end - page, true);
++    const u64 tick = scheduler.CurrentTick();
++    for (VAddr p = page; p < end; p += 0x1000) {
++        async_page_ticks[p] = tick;
++    }
++    // Close the tick right here so a CPU poll that arrives early waits only for the work up to
++    // this download, not for whatever the command processor records afterwards.
++    static const bool no_flush = std::getenv("SHAD_NO_LABEL_FLUSH") != nullptr;
++    if (!no_flush) {
++        scheduler.Flush();
++    }
++    // Experiment (SHAD_TINY_STALE=1): let the CPU read the previous value of these tiny
++    // shader-written counters without faulting; the queued download refreshes the backing
++    // bytes as soon as the GPU is done. Keeps the game's render thread from stalling on a
++    // same-frame occlusion result (lens flare) at the cost of a one-frame-old value.
++    static const bool tiny_stale = std::getenv("SHAD_NO_TINY_STALE") == nullptr; // default on
++    if (tiny_stale) {
++        // page by page, and only pages still marked: two downloads of the same page in a row
++        // (deferred dispatches) must not untrack a watcher twice
++        for (VAddr p = page; p < end; p += 0x1000) {
++            if (memory_tracker->IsRegionGpuModified(p, 0x1000)) {
++                memory_tracker->UnmarkRegionAsGpuModified(p, 0x1000, false);
++            }
++        }
++    }
++}
++
+ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size, bool async) {
+     boost::container::small_vector<vk::BufferCopy, 1> copies;
+     u64 total_size_bytes = 0;
+@@ -180,6 +225,28 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
+         gpu_modified_ranges.Subtract(address, size);
+     });
+     if (total_size_bytes == 0) {
++        // Local change: the bytes may already be in flight in an asynchronous download
++        // (DownloadSmallAsync). A synchronous request must then wait for it to land before the
++        // pages can be unprotected, otherwise the faulting read would spin forever.
++        if (!async && memory_tracker->IsRegionGpuModified(device_addr, size)) {
++            // Wait only for the tick that carries the pending download, not for everything the
++            // command processor has recorded since (it runs ahead of the GPU).
++            u64 tick = 0;
++            bool found = false;
++            for (VAddr p = device_addr & ~VAddr(0xFFF); p < device_addr + size; p += 0x1000) {
++                if (const auto it = async_page_ticks.find(p); it != async_page_ticks.end()) {
++                    tick = std::max(tick, it->second);
++                    found = true;
++                }
++            }
++            if (found) {
++                scheduler.Wait(tick);
++            } else {
++                scheduler.Finish();
++            }
++            scheduler.PopPendingOperations();
++            memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
++        }
+         return;
+     }
+     const auto download =
+@@ -214,9 +281,21 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
+ 
+ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
+                                                         ObtainBufferFlags flags) {
++    if (deferred_ranges && !deferred_ranges->empty()) {
++        for (const auto& [a, n] : *deferred_ranges) {
++            if (device_addr < a + n && a < device_addr + size) {
++                *deferred_hit = true;
++                break;
++            }
++        }
++    }
+     const bool is_written = True(flags & ObtainBufferFlags::IsWritten);
+     const bool is_texel_buffer = True(flags & ObtainBufferFlags::IsTexelBuffer);
+     const bool skip_stream_buffer = True(flags & ObtainBufferFlags::IgnoreStreamBuffer);
++    if (is_written && WatchPageHit(device_addr, size)) {
++        LOG_INFO(Render, "WATCH obtain-written addr={:#x} size={} texel={}", device_addr, size,
++                 is_texel_buffer);
++    }
+     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
+     if (!is_written && !skip_stream_buffer && size <= STREAM_THRESHOLD &&
+         !IsRegionGpuModified(device_addr, size)) {
+@@ -259,11 +338,18 @@ bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
+ }
+ 
+ void BufferCache::MarkRegionAsGpuModified(VAddr addr, size_t size) {
++    if (WatchPageHit(addr, size)) {
++        LOG_INFO(Render, "WATCH gpu-modified addr={:#x} size={}", addr, size);
++    }
+     texture_cache.MarkAsMaybeGpuDirty(addr, size);
+     memory_tracker->MarkRegionAsGpuModified(addr, size);
+     gpu_modified_ranges.Add(addr, size);
+ }
+ 
++void BufferCache::MarkRegionForCpuReadback(VAddr addr, size_t size) {
++    memory_tracker->MarkRegionAsGpuModified(addr, size);
++}
++
+ void BufferCache::ReadEdgeImagePages(const Image& image) {
+     // May happen that after downloading the image and invalidating region,
+     // that there were GPU modified ranges that are lost due to CPU reuploading.
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index a3ba3cb7..f5150014 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -3,6 +3,8 @@
+ 
+ #pragma once
+ 
++#include <absl/container/flat_hash_map.h>
++
+ #include <deque>
+ #include <boost/container/small_vector.hpp>
+ 
+@@ -98,6 +100,17 @@ public:
+     void UnmarkRegionAsGpuModified(VAddr device_addr, u64 size, bool is_write = false);
+ 
+     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
++    /// Local change (deferred compute): ranges written by not-yet-emitted dispatches; any
++    /// ObtainBuffer overlapping one sets *hit so the rasterizer can flush them first.
++    void SetDeferredWriteTracker(const std::vector<std::pair<VAddr, u64>>* ranges, bool* hit) {
++        deferred_ranges = ranges;
++        deferred_hit = hit;
++    }
++
++    /// Local change: queue an asynchronous download of the GPU-modified bytes in the page(s)
++    /// of a tiny GPU write (label/fence), so the page becomes CPU-readable without a drain.
++    void DownloadSmallAsync(VAddr addr, u64 size);
++
+     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false, bool async = false,
+                     bool assume_locks = false);
+ 
+@@ -119,6 +132,8 @@ public:
+ 
+     /// Mark region as modified from the GPU
+     void MarkRegionAsGpuModified(VAddr addr, size_t size);
++    /// Local change: protect a region so a CPU read faults, without adding a buffer download range.
++    void MarkRegionForCpuReadback(VAddr addr, size_t size);
+ 
+     /// Synchronizes all buffers needed for DMA.
+     void SynchronizeDmaBuffers();
+@@ -159,6 +174,9 @@ private:
+     Core::MemoryManager* memory;
+     TextureCache& texture_cache;
+     std::unique_ptr<MemoryTracker> memory_tracker;
++    const std::vector<std::pair<VAddr, u64>>* deferred_ranges{};
++    bool* deferred_hit{};
++    absl::flat_hash_map<VAddr, u64> async_page_ticks; ///< page -> tick of pending DownloadSmallAsync
+ 
+     StreamBuffer stream_buffer;
+     Buffer gds_buffer;
+diff --git a/src/video_core/page_manager.cpp b/src/video_core/page_manager.cpp
+index c8e463cf..0cdd0702 100644
+--- a/src/video_core/page_manager.cpp
++++ b/src/video_core/page_manager.cpp
+@@ -115,7 +115,7 @@ struct PageManager::Impl {
+         locks.reserve(start_page, end_page);
+     }
+ 
+-    void UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op) {
++    void UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op, bool is_read = false) {
+         const u64 page_start = addr >> PM_PAGE_BITS;
+         const u64 page_end = Common::DivCeil(addr + size, PM_PAGE_SIZE);
+ 
+@@ -156,7 +156,8 @@ struct PageManager::Impl {
+             }
+ 
+             // Apply the change to the page state
+-            const auto new_perms = state->Update(write_op);
++            const auto new_perms = is_read ? state->Update(PageOp::None, false, write_op, true)
++                                            : state->Update(write_op);
+             if (new_perms != perms) [[unlikely]] {
+                 // If the protection changed add pending (un)protect action
+                 release_pending();
+@@ -426,8 +427,12 @@ struct SignalImpl : public PageManager::Impl {
+         RENDERER_TRACE;
+         auto* memory = Core::Memory::Instance();
+         auto& impl = memory->GetAddressSpace();
+-        ASSERT_MSG(perms != Core::MemoryPermission::Write,
+-                   "Attempted to protect region as write-only which is not a valid permission");
++        // Local change: a region with only a read watcher (image awaiting a CPU readback) would
++        // need write-only protection, which does not exist. Block both; a write fault is
++        // handled by InvalidateMemory like any other CPU write.
++        if (perms == Core::MemoryPermission::Write) {
++            perms = Core::MemoryPermission::None;
++        }
+         impl.Protect(address, size, perms);
+     }
+ 
+@@ -475,6 +480,10 @@ void PageManager::UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op) cons
+     impl->UpdatePageWatchers(addr, size, write_op);
+ }
+ 
++void PageManager::UpdateReadWatchers(VAddr addr, u64 size, PageOp read_op) const {
++    impl->UpdatePageWatchers(addr, size, read_op, true);
++}
++
+ void PageManager::UpdatePageWatchersForRegion(VAddr base_addr, const Bounds& bounds,
+                                               const RegionBits& write_mask,
+                                               const RegionBits& read_mask, PageOp write_op,
+diff --git a/src/video_core/page_manager.h b/src/video_core/page_manager.h
+index f24c601b..c3fd207a 100644
+--- a/src/video_core/page_manager.h
++++ b/src/video_core/page_manager.h
+@@ -41,6 +41,9 @@ public:
+     /// Updates watches in the pages touching the specified region.
+     void UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op) const;
+ 
++    /// Local change: adds/removes a READ watcher on the pages of a region (CPU reads then fault).
++    void UpdateReadWatchers(VAddr addr, u64 size, PageOp read_op) const;
++
+     /// Updates watches in the pages touching the inclusive bounds using a mask.
+     void UpdatePageWatchersForRegion(VAddr base_addr, const Bounds& bounds,
+                                      const RegionBits& write_mask, const RegionBits& read_mask,
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 88ab4fc6..f7a2a6c4 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -1,6 +1,12 @@
++#include <thread>
++#include <fmt/format.h>
++#include <execinfo.h>
++#include <atomic>
++#include <cstdlib>
+ // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include "video_core/stutter_stats.h"
+ #include "common/debug.h"
+ #include "core/debug_state.h"
+ #include "core/emulator_settings.h"
+@@ -13,6 +19,7 @@
+ #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+ #include "video_core/renderer_vulkan/vk_instance.h"
+ #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
++#include "video_core/renderer_vulkan/vk_gpu_profiler.h"
+ #include "video_core/renderer_vulkan/vk_rasterizer.h"
+ #include "video_core/renderer_vulkan/vk_runtime.h"
+ #include "video_core/renderer_vulkan/vk_scheduler.h"
+@@ -33,6 +40,36 @@ static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
+     return push_data;
+ }
+ 
++
++// Local experiment helper: comma-separated list of 32-bit compute program hashes to skip.
++static bool SkipComputeProgram(u64 pgm_hash) {
++    static const std::vector<u64> skip = [] {
++        std::vector<u64> v;
++        if (const char* e = std::getenv("SHAD_SKIP_CS")) {
++            std::string s{e};
++            size_t pos = 0;
++            while (pos < s.size()) {
++                const size_t next = s.find(',', pos);
++                const std::string tok = s.substr(pos, next == std::string::npos ? std::string::npos : next - pos);
++                if (!tok.empty()) {
++                    v.push_back(std::strtoull(tok.c_str(), nullptr, 16));
++                }
++                if (next == std::string::npos) {
++                    break;
++                }
++                pos = next + 1;
++            }
++        }
++        return v;
++    }();
++    if (skip.empty()) {
++        return false;
++    }
++    const u64 low = pgm_hash & 0xFFFFFFFFull;
++    return std::find(skip.begin(), skip.end(), low) != skip.end() ||
++           std::find(skip.begin(), skip.end(), pgm_hash) != skip.end();
++}
++
+ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime& runtime_,
+                        AmdGpu::Liverpool* liverpool_)
+     : instance{instance_}, scheduler{scheduler_}, runtime{runtime_}, page_manager{this},
+@@ -47,6 +84,11 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
+     }
+     memory->SetRasterizer(this);
+ 
++    if (GpuProfiler::Enabled()) {
++        gpu_profiler = std::make_unique<GpuProfiler>(instance, scheduler);
++        scheduler.SetGpuProfiler(gpu_profiler.get());
++    }
++
+     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
+         runtime.FlushBarriers();
+         buffer_cache.SubmitPendingArenaBinds(info);
+@@ -201,18 +243,41 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
+         return;
+     }
+     const auto state = BeginRendering(pipeline);
++    if (gpu_profiler) {
++        {
++            // label with the program hashes used by the shader dump file names
++            const auto& key = pipeline->GetGraphicsKey();
++            std::remove_cvref_t<decltype(key.stage_hashes)> pgm{};
++            for (u32 i = 0; i < key.stage_hashes.size(); ++i) {
++                if (key.stage_hashes[i]) {
++                    pgm[i] = pipeline->GetStage(static_cast<Shader::SwStage>(i)).pgm_hash;
++                }
++            }
++            gpu_profiler->NoteDraw(pgm);
++        }
++    }
+ 
+     BindVertexBuffers(pipeline);
+     if (is_indexed) {
+         BindIndexBuffer(index_offset);
+     }
+ 
++    if (deferred_hit && !deferred_dispatches.empty()) {
++        scheduler.EndRendering();
++        FlushDeferredCompute();
++        scheduler.BeginRendering(state);
++    }
++
+     if (needs_barrier) {
+         runtime.FlushBarriers();
+     }
+ 
+     pipeline->BindResources(set_writes, push_data);
+     UpdateDynamicState(pipeline, is_indexed);
++    if (!deferred_dispatches.empty() && (deferred_hit || scheduler.WouldEndRendering(state))) {
++        scheduler.EndRendering();
++        FlushDeferredCompute();
++    }
+     scheduler.BeginRendering(state);
+ 
+     const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
+@@ -232,6 +297,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
+     DebugState.IncDrawCall();
+ 
+     ResetBindings(false);
++    FlushTinyWritten();
+ }
+ 
+ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 stride,
+@@ -286,7 +352,21 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
+ 
+     pipeline->BindResources(set_writes, push_data);
+     UpdateDynamicState(pipeline, is_indexed);
++    if (!deferred_dispatches.empty() && (deferred_hit || scheduler.WouldEndRendering(state))) {
++        scheduler.EndRendering();
++        FlushDeferredCompute();
++    }
+     scheduler.BeginRendering(state);
++    if (gpu_profiler) {
++        const auto& key = pipeline->GetGraphicsKey();
++        std::remove_cvref_t<decltype(key.stage_hashes)> pgm{};
++        for (u32 q = 0; q < key.stage_hashes.size(); ++q) {
++            if (key.stage_hashes[q]) {
++                pgm[q] = pipeline->GetStage(static_cast<Shader::SwStage>(q)).pgm_hash;
++            }
++        }
++        gpu_profiler->NoteDraw(pgm);
++    }
+ 
+     const auto cmdbuf = scheduler.CommandBuffer();
+     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+@@ -314,6 +394,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
+     }
+ 
+     ResetBindings(false);
++    FlushTinyWritten();
+ }
+ 
+ void Rasterizer::DispatchDirect() {
+@@ -331,24 +412,41 @@ void Rasterizer::DispatchDirect() {
+     if (ExecuteShaderHLE(cs, liverpool->regs, cs_program, *this)) {
+         return;
+     }
++    // Experiment: SHAD_SKIP_CS=hash,hash skips those compute programs (measurement only).
++    if (SkipComputeProgram(cs.pgm_hash)) {
++        return;
++    }
+ 
+     if (!BindResources(pipeline)) {
+         return;
+     }
+ 
++    if (TryDeferCompute(pipeline, cs, cs_program.dim_x, cs_program.dim_y, cs_program.dim_z)) {
++        ResetBindings(true);
++        return;
++    }
++
+     if (needs_barrier) {
+         runtime.FlushBarriers();
+     }
+ 
+     scheduler.EndRendering();
++    FlushDeferredCompute();
+     pipeline->BindResources(set_writes, push_data);
+ 
+     const auto cmdbuf = scheduler.CommandBuffer();
+     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
++    if (gpu_profiler) {
++        gpu_profiler->BeginSegment(cmdbuf, fmt::format("CS {:08x} {}x{}x{}", static_cast<u32>(cs.pgm_hash), cs_program.dim_x, cs_program.dim_y, cs_program.dim_z));
++    }
+     cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
++    if (gpu_profiler) {
++        gpu_profiler->EndSegment(cmdbuf);
++    }
+     DebugState.IncDispatch();
+ 
+     ResetBindings(true);
++    FlushTinyWritten();
+ }
+ 
+ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
+@@ -375,17 +473,29 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
+     }
+ 
+     scheduler.EndRendering();
++    FlushDeferredCompute();
+     pipeline->BindResources(set_writes, push_data);
+ 
+     const auto cmdbuf = scheduler.CommandBuffer();
+     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
++    if (gpu_profiler) {
++        gpu_profiler->BeginSegment(cmdbuf, fmt::format("CSI {:08x}", static_cast<u32>(pipeline->GetStage(Shader::SwStage::Compute).pgm_hash)));
++    }
+     cmdbuf.dispatchIndirect(buffer->Handle(), base);
++    if (gpu_profiler) {
++        gpu_profiler->EndSegment(cmdbuf);
++    }
+     DebugState.IncDispatch();
+ 
+     ResetBindings(true);
++    FlushTinyWritten();
+ }
+ 
+ u64 Rasterizer::Flush() {
++    if (!deferred_dispatches.empty()) {
++        scheduler.EndRendering();
++        FlushDeferredCompute();
++    }
+     const u64 current_tick = scheduler.CurrentTick();
+     SubmitInfo info{};
+     scheduler.Flush(info);
+@@ -393,10 +503,19 @@ u64 Rasterizer::Flush() {
+ }
+ 
+ void Rasterizer::Finish() {
++    if (!deferred_dispatches.empty()) {
++        scheduler.EndRendering();
++        FlushDeferredCompute();
++    }
+     scheduler.Finish();
+ }
+ 
+ void Rasterizer::OnSubmit() {
++    if (!deferred_dispatches.empty()) {
++        scheduler.EndRendering();
++        FlushDeferredCompute();
++    }
++    FlushTinyWritten();
+     buffer_cache.TickFrame();
+     texture_cache.ProcessDownloadImages();
+     texture_cache.RunGarbageCollector();
+@@ -404,9 +523,165 @@ void Rasterizer::OnSubmit() {
+ }
+ 
+ void Rasterizer::OnFence() {
++    // deferred dispatches are not flushed at fences: CPU reads of their results fault on the
++    // read-protected pages and flush them then (FlushDeferredForMemory)
++    FlushTinyWritten();
+     texture_cache.ProcessDownloadImages();
+ }
+ 
++void Rasterizer::NoteTinyWritten(VAddr addr, u64 size) {
++    static const bool no_async = std::getenv("SHAD_NO_ASYNC_LABELS") != nullptr;
++    if (no_async) {
++        return;
++    }
++    for (const auto& [a, s] : tiny_written) {
++        if (a == addr) {
++            return;
++        }
++    }
++    if (tiny_written.size() < 64) {
++        tiny_written.emplace_back(addr, size);
++    }
++}
++
++bool Rasterizer::TryDeferCompute(const ComputePipeline* pipeline, const Shader::Info& cs, u32 x,
++                                 u32 y, u32 z) {
++    static const bool enabled = std::getenv("SHAD_DEFER_CS") != nullptr;
++    if (!enabled || in_deferred_flush || !cs.images.empty()) {
++        return false;
++    }
++    static const bool trace = std::getenv("SHAD_DEFER_CS_TRACE") != nullptr;
++    if (trace) {
++        LOG_INFO(Render_Vulkan, "deferred compute: defer {:08x} {}x{}x{} writes={} bufinfos={} imginfos={} written_ranges={}",
++                 static_cast<u32>(cs.pgm_hash), x, y, z, set_writes.size(), buffer_infos.size(),
++                 image_infos.size(), current_bind_written.size());
++    }
++    if (trace) {
++        std::string bufs;
++        for (const auto& b : buffer_infos) {
++            bufs += fmt::format("[{:#x}+{:#x}:{:#x}]", reinterpret_cast<uintptr_t>(static_cast<VkBuffer>(b.buffer)), b.offset, b.range);
++        }
++        LOG_INFO(Render_Vulkan, "deferred compute: at-defer {:08x} pipeline={:#x} {}", static_cast<u32>(cs.pgm_hash),
++                 reinterpret_cast<uintptr_t>(static_cast<VkPipeline>(pipeline->Handle())), bufs);
++    }
++    DeferredDispatch rec{};
++    rec.pipeline = pipeline;
++    rec.buffer_infos = buffer_infos;
++    rec.image_infos = image_infos;
++    rec.set_writes = set_writes;
++    // The info arrays have inline storage, so pointers into them do not survive moves of the
++    // record: remember indices now and re-point at emit time.
++    for (auto& w : rec.set_writes) {
++        int bi = -1, ii = -1;
++        if (w.pBufferInfo) {
++            bi = static_cast<int>(w.pBufferInfo - buffer_infos.data());
++        }
++        if (w.pImageInfo) {
++            ii = static_cast<int>(w.pImageInfo - image_infos.data());
++        }
++        rec.info_index.emplace_back(bi, ii);
++    }
++    rec.push_data = push_data;
++    rec.x = x;
++    rec.y = y;
++    rec.z = z;
++    rec.pgm_hash = cs.pgm_hash;
++    rec.tiny = std::move(tiny_written);
++    tiny_written.clear();
++    for (const auto& r : current_bind_written) {
++        deferred_written.push_back(r);
++    }
++    if (deferred_dispatches.empty()) {
++        buffer_cache.SetDeferredWriteTracker(&deferred_written, &deferred_hit);
++    }
++    deferred_dispatches.push_back(std::move(rec));
++    ++deferred_total;
++    return true;
++}
++
++void Rasterizer::FlushDeferredCompute() {
++    if (deferred_dispatches.empty() || in_deferred_flush) {
++        return;
++    }
++    if (std::this_thread::get_id() != GetGpuCommandProcessorThread()) {
++        LOG_WARNING(Render_Vulkan, "deferred compute: EndRendering off the GPU thread, {} pending",
++                    deferred_dispatches.size());
++        return;
++    }
++    static const bool trace = std::getenv("SHAD_DEFER_CS_TRACE") != nullptr;
++    in_deferred_flush = true;
++    if (trace) {
++        LOG_INFO(Render_Vulkan, "deferred compute: flush {} pending, rendering={}", deferred_dispatches.size(), scheduler.IsRendering());
++    }
++    runtime.FlushBarriers();
++    boost::container::small_vector<std::pair<VAddr, u64>, 8> tiny_all;
++    for (auto& rec : deferred_dispatches) {
++        // re-fetch every time: a submit may have happened (new command buffer)
++        const auto cmdbuf = scheduler.CommandBuffer();
++        if (trace) {
++            LOG_INFO(Render_Vulkan, "deferred compute: emit {:08x} {}x{}x{} writes={} bufinfos={} tiny={}",
++                     static_cast<u32>(rec.pgm_hash), rec.x, rec.y, rec.z, rec.set_writes.size(),
++                     rec.buffer_infos.size(), rec.tiny.size());
++        }
++        for (size_t i = 0; i < rec.set_writes.size(); ++i) {
++            const auto [bi, ii] = rec.info_index[i];
++            rec.set_writes[i].pBufferInfo = bi >= 0 ? rec.buffer_infos.data() + bi : nullptr;
++            rec.set_writes[i].pImageInfo = ii >= 0 ? rec.image_infos.data() + ii : nullptr;
++        }
++        if (trace) {
++            std::string bufs;
++            for (const auto& b : rec.buffer_infos) {
++                bufs += fmt::format("[{:#x}+{:#x}:{:#x}]", reinterpret_cast<uintptr_t>(static_cast<VkBuffer>(b.buffer)), b.offset, b.range);
++            }
++            LOG_INFO(Render_Vulkan, "deferred compute: step bind {:08x} pipeline={:#x} writes={} {}",
++                     static_cast<u32>(rec.pgm_hash), reinterpret_cast<uintptr_t>(static_cast<VkPipeline>(rec.pipeline->Handle())),
++                     rec.set_writes.size(), bufs);
++        }
++        rec.pipeline->BindResources(rec.set_writes, rec.push_data);
++        if (trace) {
++            LOG_INFO(Render_Vulkan, "deferred compute: step pipeline");
++        }
++        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, rec.pipeline->Handle());
++        if (trace) {
++            LOG_INFO(Render_Vulkan, "deferred compute: step dispatch {}x{}x{}", rec.x, rec.y, rec.z);
++        }
++        // no profiler timestamps here: a fence can land while a blit encoder is active and
++        // the Metal layer crashes on a timestamp written outside render/compute encoders
++        cmdbuf.dispatch(rec.x, rec.y, rec.z);
++        DebugState.IncDispatch();
++        static std::atomic<u64> emitted{0};
++        if ((++emitted % 2000) == 0) {
++            LOG_INFO(Render_Vulkan, "deferred compute: emitted {} total, deferred {} total", emitted.load(),
++                     deferred_total.load());
++        }
++        for (const auto& t : rec.tiny) {
++            tiny_all.push_back(t);
++        }
++    }
++    deferred_dispatches.clear();
++    // the tiny-buffer downloads submit (Flush) - do them once, after all dispatches
++    if (!tiny_all.empty()) {
++        for (const auto& t : tiny_all) {
++            NoteTinyWritten(t.first, t.second);
++        }
++        FlushTinyWritten();
++    }
++    deferred_written.clear();
++    deferred_hit = false;
++    buffer_cache.SetDeferredWriteTracker(nullptr, nullptr);
++    in_deferred_flush = false;
++}
++
++void Rasterizer::FlushTinyWritten() {
++    if (tiny_written.empty()) {
++        return;
++    }
++    for (const auto& [addr, size] : tiny_written) {
++        buffer_cache.DownloadSmallAsync(addr, size);
++    }
++    tiny_written.clear();
++}
++
+ bool Rasterizer::BindResources(const Pipeline* pipeline) {
+     if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
+         IsComputeImageClear(pipeline)) {
+@@ -417,6 +692,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
+     set_writes.clear();
+     buffer_infos.clear();
+     image_infos.clear();
++    current_bind_written.clear();
+ 
+     bool uses_dma = false;
+ 
+@@ -822,6 +1098,13 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
+                 VideoCore::ObtainBufferFlags flags = {};
+                 if (desc.is_written) {
+                     flags |= VideoCore::ObtainBufferFlags::IsWritten;
++                    current_bind_written.emplace_back(vsharp.base_address, size);
++                    // Local change: a tiny shader-written buffer is a counter/label the CPU
++                    // polls (FIFA: 3 x 8 bytes per frame). Remember it and queue an async
++                    // download at the next fence so the poll does not fault and drain the GPU.
++                    if (size <= 64) {
++                        NoteTinyWritten(vsharp.base_address, size);
++                    }
+                 }
+                 if (desc.is_formatted) {
+                     flags |= VideoCore::ObtainBufferFlags::IsTexelBuffer;
+@@ -902,6 +1185,12 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
+ 
+             image_id = texture_cache.FindImage(desc);
+             auto* image = &texture_cache.GetImage(image_id);
++            // deferred compute: a texture aliasing memory a pending dispatch writes must see
++            // the dispatch first (the game reads compute results through images too)
++            if (!deferred_written.empty() &&
++                DeferredOverlaps(image->info.guest_address, image->info.guest_size)) {
++                deferred_hit = true;
++            }
+             if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
+                 // If this image has an associated depth image, it's a stencil attachment.
+                 // Redirect the access to the actual depth-stencil buffer.
+@@ -1203,6 +1492,10 @@ void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
+ }
+ 
+ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds) {
++    static const bool log_readbacks = std::getenv("SHAD_LOG_GPUWRITES") != nullptr;
++    if (log_readbacks && !is_gds) {
++        LOG_INFO(Render, "GPUWRITE fill addr={:#x} size={}", address, num_bytes);
++    }
+     ASSERT_MSG(address % 4 == 0 && num_bytes % 4 == 0,
+                "FillBuffer address and size must be a multiple of 4 bytes");
+     if (!is_gds) {
+@@ -1220,10 +1513,24 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
+         return buffer_cache.ObtainBuffer(address, num_bytes,
+                                          VideoCore::ObtainBufferFlags::IsWritten);
+     }();
++    if (deferred_hit && !deferred_dispatches.empty()) {
++        scheduler.EndRendering();
++        FlushDeferredCompute();
++    }
+     runtime.FillBuffer(buffer, offset, num_bytes, value);
++    if (!is_gds && num_bytes <= 64) {
++        static const bool no_async = std::getenv("SHAD_NO_ASYNC_LABELS") != nullptr;
++        if (!no_async) {
++            buffer_cache.DownloadSmallAsync(address, num_bytes);
++        }
++    }
+ }
+ 
+ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
++    static const bool log_readbacks = std::getenv("SHAD_LOG_GPUWRITES") != nullptr;
++    if (log_readbacks && !dst_gds) {
++        LOG_INFO(Render, "GPUWRITE copy dst={:#x} size={} src_gds={}", dst, num_bytes, src_gds);
++    }
+     if (!dst_gds && !buffer_cache.IsRegionGpuModified(dst, num_bytes)) {
+         if (!src_gds && !buffer_cache.IsRegionGpuModified(src, num_bytes) &&
+             !texture_cache.FindImageFromRange(src, num_bytes)) {
+@@ -1254,7 +1561,17 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
+         .dstOffset = dst_offset,
+         .size = num_bytes,
+     };
++    if (deferred_hit && !deferred_dispatches.empty()) {
++        scheduler.EndRendering();
++        FlushDeferredCompute();
++    }
+     runtime.CopyBuffer(src_buffer, dst_buffer, std::span{&copy, 1});
++    if (!dst_gds && num_bytes <= 64) {
++        static const bool no_async = std::getenv("SHAD_NO_ASYNC_LABELS") != nullptr;
++        if (!no_async) {
++            buffer_cache.DownloadSmallAsync(dst, num_bytes);
++        }
++    }
+ }
+ 
+ u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {
+@@ -1264,21 +1581,127 @@ u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {
+     return value;
+ }
+ 
++bool Rasterizer::DeferredOverlaps(VAddr addr, u64 size) const {
++    for (const auto& [a, n] : deferred_written) {
++        if (addr < a + n && a < addr + size) {
++            return true;
++        }
++    }
++    return false;
++}
++
++void Rasterizer::FlushDeferredForMemory(VAddr addr, u64 size, bool assume_locks) {
++    if (deferred_dispatches.empty()) {
++        return;
++    }
++    const auto do_flush = [this, addr, size] {
++        if (!deferred_dispatches.empty() && DeferredOverlaps(addr, size)) {
++            scheduler.EndRendering();
++            FlushDeferredCompute();
++        }
++    };
++    if (assume_locks) {
++        do_flush();
++    } else {
++        liverpool->SendCommand<true>(do_flush);
++    }
++}
++
+ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
++    VideoCore::StutterStats::Scope _ss{VideoCore::StutterStats::Get().faults, VideoCore::StutterStats::Get().fault_us};
+     if (!IsMapped(addr, size)) {
+         // Not GPU mapped memory, can skip invalidation logic entirely.
+         return false;
+     }
++    // Local diagnostic: SHAD_LOG_READBACKS=1 also logs CPU write faults into GPU-modified pages
++    // (these trigger a synchronous download + GPU wait) with their duration.
++    static const bool log_writes = std::getenv("SHAD_LOG_READBACKS") != nullptr;
++    // SHAD_LOG_WRITEFAULTS=1: sample every 16th CPU write fault (any page) for a histogram
++    static const bool log_all_writes = std::getenv("SHAD_LOG_WRITEFAULTS") != nullptr;
++    if (log_all_writes) {
++        static std::atomic<u32> n{0};
++        if ((++n & 15) == 0) {
++            LOG_INFO(Render, "WFAULT addr={:#x} gpu_thread={}", addr, assume_locks);
++        }
++    }
++    const bool gpu_mod = log_writes && buffer_cache.IsRegionGpuModified(addr, size);
++    const auto wf_t0 = log_writes ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
++    struct LogAtExit {
++        bool on; VAddr addr; u64 size; bool gpu_mod; bool gpu_thread; std::chrono::steady_clock::time_point t0;
++        ~LogAtExit() {
++            if (on) {
++                const auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
++                LOG_INFO(Render, "WRITEFAULT addr={:#x} size={} gpu_modified={} gpu_thread={} us={}", addr, size, gpu_mod, gpu_thread, us);
++            }
++        }
++    } _wf{log_writes && gpu_mod, addr, size, gpu_mod, assume_locks, wf_t0};
++    // Local change: a CPU write into a page of an image that still awaits its on-demand
++    // readback must not discard that readback (the game writes next to / into composites it
++    // later reads back: kit and face textures came out wrong). Download first, then invalidate.
++    FlushDeferredForMemory(addr, size, assume_locks);
++    static const bool keep_pending = std::getenv("SHAD_DROP_PENDING_ON_WRITE") == nullptr;
++    if (keep_pending) {
++        const auto image_flush = [this, addr, size] {
++            texture_cache.DownloadImagesForCpuRead(addr, size, /*for_write=*/true);
++        };
++        if (assume_locks) {
++            image_flush();
++        } else {
++            liverpool->SendCommand<true>(image_flush);
++        }
++    }
+     buffer_cache.InvalidateMemory(addr, size, assume_locks);
+     texture_cache.InvalidateMemory(addr, size);
+     return true;
+ }
+ 
+ bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {
++    VideoCore::StutterStats::Scope _ss{VideoCore::StutterStats::Get().faults, VideoCore::StutterStats::Get().fault_us};
++    struct SlowReadLog {
++        VAddr addr; bool gpu_thread; std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
++        ~SlowReadLog() {
++            if (!VideoCore::StutterStats::Enabled()) {
++                return;
++            }
++            const auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
++            if (us > 3000) {
++                LOG_INFO(Render, "SLOWREAD {:.1f} ms addr={:#x} gpu_thread={}", us / 1000.0, addr, gpu_thread);
++            }
++        }
++    } _slow{addr, assume_locks};
+     if (!IsMapped(addr, size)) {
+         // Not GPU mapped memory, can skip invalidation logic entirely.
+         return false;
+     }
++    // Local diagnostic: SHAD_LOG_READBACKS=1 logs every CPU read fault on GPU-written memory
++    // (address, size, GPU thread or not) so the per-frame readback hot spots can be found.
++    static const bool log_readbacks = std::getenv("SHAD_LOG_READBACKS") != nullptr;
++    if (log_readbacks) {
++        LOG_INFO(Render, "READBACK addr={:#x} size={} gpu_thread={}", addr, size, assume_locks);
++        // GPU-thread read faults: dump a raw backtrace for the first few and then every 500th,
++        // symbolicated offline against the binary's symbol table.
++        static std::atomic<u32> gpu_faults{0};
++        if (assume_locks) {
++            const u32 n = gpu_faults.fetch_add(1);
++            if (n < 8 || n % 500 == 0) {
++                void* frames[24];
++                const int count = backtrace(frames, 24);
++                std::string bt;
++                for (int i = 0; i < count; ++i) {
++                    bt += fmt::format("{:#x} ", reinterpret_cast<uintptr_t>(frames[i]));
++                }
++                LOG_INFO(Render, "READBACK-BT n={} {}", n, bt);
++            }
++        }
++    }
++    FlushDeferredForMemory(addr, size, assume_locks);
++    // Local change: GPU-written tiled images are downloaded on the first CPU read.
++    const auto image_flush = [this, addr, size] { texture_cache.DownloadImagesForCpuRead(addr, size); };
++    if (assume_locks) {
++        image_flush();
++    } else {
++        liverpool->SendCommand<true>(image_flush);
++    }
+     buffer_cache.ReadMemory(addr, size, false, false, assume_locks);
+     return true;
+ }
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index e01715c5..c098d7fe 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -3,6 +3,11 @@
+ 
+ #pragma once
+ 
++#include <atomic>
++#include <memory>
++
++#include <boost/container/small_vector.hpp>
++
+ #include "common/recursive_lock.h"
+ #include "common/shared_first_mutex.h"
+ #include "video_core/buffer_cache/buffer_cache.h"
+@@ -24,6 +29,8 @@ namespace Vulkan {
+ class GraphicsPipeline;
+ class Runtime;
+ 
++class GpuProfiler;
++
+ class Rasterizer {
+ public:
+     explicit Rasterizer(const Instance& instance, Scheduler& scheduler, Runtime& runtime,
+@@ -75,6 +82,16 @@ public:
+     bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false);
+     bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
+     bool IsMapped(VAddr addr, u64 size);
++    void NoteTinyWritten(VAddr addr, u64 size);
++    void FlushDeferredCompute();
++    bool DeferredOverlaps(VAddr addr, u64 size) const;
++    void FlushDeferredForMemory(VAddr addr, u64 size, bool assume_locks);
++    bool TryDeferCompute(const ComputePipeline* pipeline, const Shader::Info& cs, u32 x, u32 y,
++                         u32 z);
++    void FlushTinyWritten();
++    bool IsRegionGpuModified(VAddr addr, u64 size) {
++        return buffer_cache.IsRegionGpuModified(addr, size);
++    }
+     void MapMemory(VAddr addr, u64 size);
+     void RegisterMemory(VAddr addr, u64 size);
+     void UnmapMemory(VAddr addr, u64 size);
+@@ -137,8 +154,29 @@ private:
+ 
+     const Instance& instance;
+     Scheduler& scheduler;
++    std::unique_ptr<GpuProfiler> gpu_profiler;
+     Runtime& runtime;
+     VideoCore::PageManager page_manager;
++    boost::container::small_vector<std::pair<VAddr, u64>, 8> tiny_written;
++    // Local change: compute dispatches deferred to the end of the current render pass so a
++    // dispatch does not split the pass (Metal: store + reload of all attachments per split).
++    struct DeferredDispatch {
++        const ComputePipeline* pipeline;
++        boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> image_infos;
++        boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;
++        Pipeline::DescriptorWrites set_writes;
++        std::vector<std::pair<int, int>> info_index; ///< per write: index into buffer_infos / image_infos
++        Shader::PushData push_data;
++        u32 x, y, z;
++        u64 pgm_hash;
++        boost::container::small_vector<std::pair<VAddr, u64>, 8> tiny;
++    };
++    std::vector<DeferredDispatch> deferred_dispatches;
++    std::vector<std::pair<VAddr, u64>> deferred_written;
++    std::vector<std::pair<VAddr, u64>> current_bind_written;
++    bool deferred_hit{false};
++    std::atomic<u64> deferred_total{0};
++    bool in_deferred_flush{false};
+     VideoCore::BufferCache buffer_cache;
+     VideoCore::TextureCache texture_cache;
+     AmdGpu::Liverpool* liverpool;
+diff --git a/src/video_core/texture_cache/image_info.cpp b/src/video_core/texture_cache/image_info.cpp
+index 5b99e73b..b6df5527 100644
+--- a/src/video_core/texture_cache/image_info.cpp
++++ b/src/video_core/texture_cache/image_info.cpp
+@@ -1,6 +1,7 @@
+ // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <cstdlib>
+ #include "common/assert.h"
+ #include "core/libraries/kernel/process.h"
+ #include "core/libraries/videoout/buffer.h"
+@@ -164,6 +165,15 @@ ImageInfo::ImageInfo(const AmdGpu::Image& sharp, const Shader::ImageResource& de
+     size.depth = props.is_volume ? image.depth + 1 : 1;
+     pitch = image.Pitch();
+     resources.levels = image.NumLevels();
++    {
++        // Diagnostic experiment (local): SHAD_HUD_MIP0=1 limits tiled, non-block images whose
++        // pitch differs from their width to a single mip level.
++        static const bool hud_mip0 = std::getenv("SHAD_HUD_MIP0") != nullptr;
++        if (hud_mip0 && props.is_tiled && !props.is_block && resources.levels > 1 &&
++            pitch != size.width) {
++            resources.levels = 1;
++        }
++    }
+     resources.layers = image.NumLayers();
+     num_samples = image.NumSamples();
+     num_bits = NumBitsPerBlock(data_fmt);
+diff --git a/src/video_core/texture_cache/image_view.cpp b/src/video_core/texture_cache/image_view.cpp
+index 95daedd2..8fc79b22 100644
+--- a/src/video_core/texture_cache/image_view.cpp
++++ b/src/video_core/texture_cache/image_view.cpp
+@@ -1,3 +1,4 @@
++#include <cstdlib>
+ // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+@@ -65,6 +66,16 @@ ImageViewInfo::ImageViewInfo(const AmdGpu::Image& image, const Shader::ImageReso
+     range.base.layer = std::min<u32>(image.base_array, image.NumLayers() - 1);
+     range.extent.levels = image.NumViewLevels(desc.is_array);
+     range.extent.layers = image.NumViewLayers(desc.is_array);
++    {
++        // Diagnostic experiment (local, must match ImageInfo): SHAD_HUD_MIP0=1 limits tiled,
++        // non-block images whose pitch differs from their width to a single mip level.
++        static const bool hud_mip0 = std::getenv("SHAD_HUD_MIP0") != nullptr;
++        if (hud_mip0 && image.IsTiled() && !AmdGpu::IsBlockCoded(dfmt) &&
++            image.NumLevels() > 1 && image.Pitch() != image.width + 1) {
++            range.base.level = 0;
++            range.extent.levels = 1;
++        }
++    }
+     type = image.GetViewType(desc.is_array);
+     min_lod = static_cast<u32>(image.min_lod);
+     if (!is_storage) {
+diff --git a/src/video_core/texture_cache/texture_cache.cpp b/src/video_core/texture_cache/texture_cache.cpp
+index 35e6ba66..519e5169 100644
+--- a/src/video_core/texture_cache/texture_cache.cpp
++++ b/src/video_core/texture_cache/texture_cache.cpp
+@@ -2,9 +2,12 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include <cstdlib>
++#include <unordered_set>
+ #include <limits>
+ #include <xxhash.h>
+ 
++#include "video_core/stutter_stats.h"
+ #include "common/assert.h"
+ #include "common/debug.h"
+ #include "common/div_ceil.h"
+@@ -89,6 +92,25 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
+         std::max<s64>(std::min(device_local_memory - min_vacancy_critical, min_spacing_critical),
+                       min_critical_floor));
+     trigger_gc_memory = static_cast<u64>((device_local_memory - mem_threshold) / 2);
++    // Local change: SHAD_GC_MB=<trigger MB> raises the GC thresholds (unified memory Macs have
++    // far more than the heuristics assume; the per-frame GC was costing up to 33 ms a frame).
++    // Default on this platform: the Metal layer reports a ~2 GB budget on a 32 GB unified-memory
++    // machine, which kept the collector in its "pressured" mode every frame. Use 3/4.5/6 GB
++    // unless the reported budget is genuinely larger.
++    if (device_local_memory < static_cast<s64>(4_GB)) {
++        trigger_gc_memory = 3_GB;
++        pressure_gc_memory = 4_GB + 512_MB;
++        critical_gc_memory = 6_GB;
++    }
++    if (const char* e = std::getenv("SHAD_GC_MB")) {
++        const u64 mb = std::strtoull(e, nullptr, 10);
++        trigger_gc_memory = mb << 20;
++        pressure_gc_memory = (mb + mb / 2) << 20;
++        critical_gc_memory = (mb * 2) << 20;
++    }
++    LOG_INFO(Render_Vulkan, "Texture GC thresholds: trigger {} MB, pressure {} MB, critical {} MB (budget {} MB)",
++             trigger_gc_memory >> 20, pressure_gc_memory >> 20, critical_gc_memory >> 20,
++             static_cast<u64>(device_local_memory) >> 20);
+ }
+ 
+ TextureCache::~TextureCache() = default;
+@@ -188,6 +210,12 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
+     ForEachImageInRegion(pages_start, pages_end - pages_start,
+                          [&](ImageId image_id, Image&) { image_ids.push_back(image_id); });
+ 
++    for (const auto image_id : image_ids) {
++        // Local change: a CPU write into an image awaiting an on-demand readback ends the
++        // readback and lifts the read protection, otherwise the write faults forever.
++        ForgetOndemandImage(image_id);
++    }
++
+     for (const auto image_id : image_ids) {
+         Image& image = slot_images[image_id];
+         std::scoped_lock lk{image.mutex};
+@@ -704,14 +732,214 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
+     return {};
+ }
+ 
++// Local change: SHAD_READBACK_TILED=<max pixels> also queues GPU-written *tiled* images for
++// readback to guest memory. FIFA composites player kit/skin textures with the GPU into tiled
++// textures that the CPU then reads; without the readback the CPU sees stale memory and the
++// close-up player models (kit selection, warm-up) render white or as noise. The download path
++// already handles tiling via TileManager; upstream only enables it for linear images.
++static u64 ReadbackTiledMaxPixels() {
++    static const u64 value = [] {
++        const char* env = std::getenv("SHAD_READBACK_TILED");
++        if (!env || !*env) {
++            return u64{0};
++        }
++        const u64 v = std::strtoull(env, nullptr, 10);
++        // Default 256x256: the CPU-read composites are 32x8..128x128. Larger GPU-only images
++        // (render targets, shadow maps) must not be written back: by the time the deferred
++        // write lands the game may have reused that memory, e.g. for a thread stack.
++        return v == 0 || v == 1 ? u64{256 * 256} : v;
++    }();
++    return value;
++}
++
++static bool ShouldReadbackImage(const Image& image) {
++    if (!image.info.props.is_tiled || image.info.size.width <= 8) {
++        return true;
++    }
++    static const bool log_images = std::getenv("SHAD_LOG_IMAGES") != nullptr;
++    const u32 w = image.info.size.width, h = image.info.size.height;
++    const u64 pixels = u64{w} * h;
++    bool ok = pixels <= ReadbackTiledMaxPixels();
++    // Exclude what is clearly a frame-sized render target or an HDR/depth/shadow buffer; the
++    // CPU never reads those back and each would cost a full download per frame.
++    switch (image.info.pixel_format) {
++    case vk::Format::eB10G11R11UfloatPack32:
++    case vk::Format::eR16G16B16A16Sfloat:
++    case vk::Format::eR32Sfloat:
++    case vk::Format::eD32Sfloat:
++    case vk::Format::eD32SfloatS8Uint:
++    case vk::Format::eD16Unorm:
++    case vk::Format::eD24UnormS8Uint:
++        ok = false;
++        break;
++    default:
++        break;
++    }
++    if (w == 1920 || w == 1280 || w == 960 || h == 1080 || h == 720 || h == 540) {
++        ok = false;
++    }
++    if (log_images) {
++        static std::unordered_set<u64> seen;
++        const u64 key = (image.info.guest_address * 1000003ULL) ^ (u64{w} << 32) ^ h;
++        if (seen.insert(key).second) {
++            LOG_INFO(Render_Vulkan, "TILEDRB {} addr={:#x} fmt={} {}x{} mips={}", ok ? "accept" : "reject",
++                     image.info.guest_address, vk::to_string(image.info.pixel_format), w, h,
++                     image.info.resources.levels);
++        }
++    }
++    return ok;
++}
++
++// Local change: tiled images are not read back eagerly after every GPU write (a 4096x4096 mask
++// written per frame costs a GPU stall each time). Instead the region is protected so the first
++// CPU read faults, and the download happens then (DownloadImagesForCpuRead). Set
++// SHAD_READBACK_EAGER=1 to restore the eager behaviour for tiled images too.
++void TextureCache::QueueReadback(ImageId image_id, Image& image) {
++    static const bool eager = std::getenv("SHAD_READBACK_EAGER") != nullptr;
++    std::unique_lock lk{download_images_mutex};
++    // Default on: every GPU-written image is read back on demand (first CPU read fault).
++    // SHAD_READBACK_EAGER_LINEAR=1 restores eager downloads of linear/tiny images.
++    static const bool all_ondemand = std::getenv("SHAD_READBACK_EAGER_LINEAR") == nullptr;
++    if (eager || (!all_ondemand && (!image.info.props.is_tiled || image.info.size.width <= 8))) {
++        static const bool log_images = std::getenv("SHAD_LOG_IMAGES") != nullptr;
++        if (log_images) {
++            LOG_INFO(Render_Vulkan, "EAGER download addr={:#x} {}x{} fmt={} tiled={}",
++                     image.info.guest_address, image.info.size.width, image.info.size.height,
++                     vk::to_string(image.info.pixel_format), static_cast<bool>(image.info.props.is_tiled));
++        }
++        download_images.emplace(image_id);
++        return;
++    }
++    if (!ondemand_images.insert(image_id).second) {
++        return; // already protected and pending
++    }
++    static const bool log_images = std::getenv("SHAD_LOG_IMAGES") != nullptr;
++    if (log_images) {
++        LOG_INFO(Render_Vulkan, "ONDEMAND protect addr={:#x} {}x{} fmt={}", image.info.guest_address,
++                 image.info.size.width, image.info.size.height, vk::to_string(image.info.pixel_format));
++    }
++    ProtectForCpuRead(image.info.guest_address, image.info.guest_size, true);
++}
++
++// Precise readbacks: reuse the buffer cache's GPU-modified tracking (it protects reads).
++// Relaxed/Disabled: that tracking never protects reads, so add our own read watchers on the
++// pages, refcounted per page so two images sharing a page do not double-track.
++void TextureCache::ProtectForCpuRead(VAddr addr, size_t size, bool protect) {
++    if (EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::Precise) {
++        if (protect) {
++            buffer_cache.MarkRegionForCpuReadback(addr, size);
++        } else {
++            buffer_cache.UnmarkRegionAsGpuModified(addr, size, true);
++        }
++        return;
++    }
++    const VAddr first = PageManager::GetPageAddr(addr);
++    const VAddr last = PageManager::GetNextPageAddr(addr + size - 1);
++    for (VAddr page = first; page < last; page += 4096) {
++        auto& refs = ondemand_page_refs[page];
++        if (protect) {
++            if (refs++ == 0) {
++                page_manager.UpdateReadWatchers(page, 4096, PageOp::Track);
++            }
++        } else if (refs > 0) {
++            if (--refs == 0) {
++                page_manager.UpdateReadWatchers(page, 4096, PageOp::Untrack);
++                ondemand_page_refs.erase(page);
++            }
++        }
++    }
++}
++
++void TextureCache::DownloadImagesForCpuRead(VAddr addr, size_t size, bool for_write) {
++    boost::container::small_vector<std::pair<ImageId, bool>, 4> ids;
++    boost::container::small_vector<ImageId, 4> async_ids;
++    {
++        std::unique_lock lk{download_images_mutex};
++        if (ondemand_images.empty()) {
++            return;
++        }
++        // Protection is per page, so a fault on a page shared with an image must resolve the
++        // image even if the accessed bytes lie outside it (e.g. shader code next to a texture).
++        const auto pages_start = PageManager::GetPageAddr(addr);
++        const auto pages_end = PageManager::GetNextPageAddr(addr + size - 1);
++        ForEachImageInRegion(pages_start, pages_end - pages_start, [&](ImageId image_id, Image& image) {
++            if (ondemand_images.contains(image_id)) {
++                ids.emplace_back(image_id, True(image.flags & ImageFlagBits::GpuModified));
++            }
++        });
++        // for a CPU write: images whose bytes the write does not touch can be written back
++        // asynchronously (the game writes a neighbour in the same page every frame)
++        if (for_write) {
++            for (auto& [id, modified] : ids) {
++                const auto& im = slot_images[id];
++                const bool touches = addr < im.info.guest_address + im.info.guest_size &&
++                                     im.info.guest_address < addr + size;
++                // an image the CPU has read before may be read again right after this write:
++                // keep the synchronous download for it (a stale read gave glowing players)
++                const bool cpu_reads_it = cpu_read_images.contains(im.info.guest_address);
++                if (!touches && modified && !cpu_reads_it) {
++                    modified = false;            // not a sync download
++                    async_ids.push_back(id);     // but an async one
++                    async_written_images.insert(im.info.guest_address);
++                }
++            }
++        } else {
++            for (const auto& [id, _] : ids) {
++                const VAddr a = slot_images[id].info.guest_address;
++                if (cpu_read_images.insert(a).second && async_written_images.contains(a)) {
++                    // first CPU read of an image that already took the async path: the read may
++                    // have seen a stale copy (this is the window the read-history rule cannot close)
++                    LOG_WARNING(Render_Vulkan, "ONDEMAND RACE-RISK first read after async write-back addr={:#x}", a);
++                }
++            }
++        }
++        for (const auto& [id, _] : ids) {
++            ondemand_images.erase(id);
++        }
++    }
++    for (const auto& [id, modified] : ids) {
++        static const bool log_images = std::getenv("SHAD_LOG_IMAGES") != nullptr;
++        if (log_images) {
++            const auto& im = slot_images[id];
++            LOG_INFO(Render_Vulkan, "ONDEMAND download addr={:#x} {}x{} fmt={} modified={}",
++                     im.info.guest_address, im.info.size.width, im.info.size.height,
++                     vk::to_string(im.info.pixel_format), modified);
++        }
++        if (modified) {
++            DownloadImageMemory(id, DownloadMemoryFlags::Sync | DownloadMemoryFlags::DiscardBufferCache);
++        }
++    }
++    for (const auto id : async_ids) {
++        static std::atomic<u64> n{0};
++        if ((++n % 500) == 0) {
++            LOG_INFO(Render_Vulkan, "ONDEMAND async write-back #{} (neighbour CPU write)", n.load());
++        }
++        DownloadImageMemory(id, DownloadMemoryFlags::DiscardBufferCache);
++    }
++    for (const auto& [id, _] : ids) {
++        // Always lift the read protection of the whole image, so a page that the download
++        // did not cover (e.g. mip tail) cannot fault forever.
++        const auto& image = slot_images[id];
++        std::unique_lock lk{download_images_mutex};
++        ProtectForCpuRead(image.info.guest_address, image.info.guest_size, false);
++    }
++}
++
++void TextureCache::ForgetOndemandImage(ImageId image_id) {
++    std::unique_lock lk{download_images_mutex};
++    if (ondemand_images.erase(image_id)) {
++        const auto& image = slot_images[image_id];
++        ProtectForCpuRead(image.info.guest_address, image.info.guest_size, false);
++    }
++}
++
+ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
+     Image& image = slot_images[image_id];
+     if (desc.type == BindingType::Storage) {
+         image.flags |= ImageFlagBits::GpuModified;
+-        if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
++        if (readback_linear_images && ShouldReadbackImage(image) &&
+             image.info.guest_address != 0) {
+-            std::unique_lock lk{download_images_mutex};
+-            download_images.emplace(image_id);
++            QueueReadback(image_id, image);
+         }
+     }
+     UpdateImage(image_id);
+@@ -746,9 +974,8 @@ void TextureCache::UnregisterMeta(VAddr address, u64 owner_uid) {
+ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& desc) {
+     Image& image = slot_images[image_id];
+     image.flags |= ImageFlagBits::GpuModified;
+-    if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8)) {
+-        std::unique_lock lk{download_images_mutex};
+-        download_images.emplace(image_id);
++    if (readback_linear_images && ShouldReadbackImage(image)) {
++        QueueReadback(image_id, image);
+     }
+     image.usage.render_target = 1u;
+     UpdateImage(image_id);
+@@ -841,6 +1068,40 @@ void TextureCache::AssociateStencil(ImageId depth_id, const ImageInfo& depth_inf
+ }
+ 
+ void TextureCache::RefreshImage(Image& image) {
++    // Local diagnostic: time this refresh; log slow ones (SHAD_STUTTER=1) with the image info.
++    struct SlowUploadLog {
++        const Image& image;
++        std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
++        ~SlowUploadLog() {
++            if (!VideoCore::StutterStats::Enabled()) {
++                return;
++            }
++            const auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
++            if (us > 3000) {
++                LOG_INFO(Render_Vulkan, "SLOWUPLOAD {:.1f} ms addr={:#x} {}x{} mips={} fmt={} tiled={} size={:#x}", us / 1000.0,
++                         image.info.guest_address, image.info.size.width, image.info.size.height, image.info.resources.levels,
++                         vk::to_string(image.info.pixel_format), static_cast<u32>(image.info.props.is_tiled), image.info.guest_size);
++            }
++        }
++    } _slow{image};
++    static const bool log_images = std::getenv("SHAD_LOG_IMAGES") != nullptr;
++    if (log_images) {
++        const auto& i = image.info;
++        static std::unordered_set<u64> seen;
++        const u64 key = (i.guest_address * 1000003ULL) ^ (static_cast<u64>(i.pixel_format) << 48) ^
++                        (static_cast<u64>(i.size.width) << 32) ^ (static_cast<u64>(i.size.height) << 16) ^
++                        i.resources.levels;
++        if (seen.insert(key).second) {
++        LOG_INFO(Render_Vulkan,
++                 "IMGUP addr={:#x} fmt={} {}x{}x{} mips={} layers={} pitch={} bits={} tile={} "
++                 "array={} tiled={} block={} pow2={} guest_size={:#x}",
++                 i.guest_address, vk::to_string(i.pixel_format), i.size.width, i.size.height,
++                 i.size.depth, i.resources.levels, i.resources.layers, i.pitch, i.num_bits,
++                 static_cast<int>(i.tile_mode), static_cast<int>(i.array_mode),
++                 static_cast<u32>(i.props.is_tiled), static_cast<u32>(i.props.is_block),
++                 static_cast<u32>(i.props.is_pow2), i.guest_size);
++        }
++    }
+     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
+         return;
+     }
+@@ -1219,6 +1480,7 @@ void TextureCache::GarbageCollectSamplers() {
+ }
+ 
+ void TextureCache::RunGarbageCollector() {
++    VideoCore::StutterStats::Scope _ss{VideoCore::StutterStats::Get().gc_runs, VideoCore::StutterStats::Get().gc_us};
+     GarbageCollectImages();
+     GarbageCollectSamplers();
+     ++gc_tick;
+@@ -1229,6 +1491,7 @@ void TextureCache::TouchImage(Image& image) {
+ }
+ 
+ void TextureCache::DeleteImage(ImageId image_id) {
++    ForgetOndemandImage(image_id);
+     Image& image = slot_images[image_id];
+     ASSERT_MSG(image.IsUntracked(), "Image was not untracked");
+     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered), "Image was not unregistered");
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 54253b4d..8692a3d2 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -120,6 +120,14 @@ public:
+     /// Invalidates any image in the logical page range.
+     void InvalidateMemory(VAddr addr, size_t size);
+ 
++    /// Local change: download GPU-written images overlapping a region the CPU is reading now.
++    /// write_range: the exact bytes a CPU write touches; images outside it are downloaded
++    /// asynchronously (no GPU drain) since their bytes are not being overwritten.
++    void DownloadImagesForCpuRead(VAddr addr, size_t size, bool for_write = false);
++    void QueueReadback(ImageId image_id, Image& image);
++    void ForgetOndemandImage(ImageId image_id);
++    void ProtectForCpuRead(VAddr addr, size_t size, bool protect);
++
+     /// Marks an image as dirty if it exists at the provided address.
+     void InvalidateMemoryFromGPU(VAddr address, size_t max_size);
+ 
+@@ -412,6 +420,10 @@ private:
+     TileManager tile_manager;
+     absl::flat_hash_map<u64, SamplerId> samplers;
+     absl::flat_hash_set<ImageId> download_images;
++    absl::flat_hash_set<ImageId> ondemand_images; ///< tiled images awaiting a CPU read fault
++    absl::flat_hash_map<VAddr, u32> ondemand_page_refs; ///< read-watcher refcount per page (relaxed mode)
++    absl::flat_hash_set<VAddr> cpu_read_images; ///< guest addresses of images the CPU has read back at least once
++    absl::flat_hash_set<VAddr> async_written_images; ///< took the async write-back path at least once
+     u64 total_used_memory = 0;
+     u64 trigger_gc_memory = 0;
+     u64 pressure_gc_memory = 0;

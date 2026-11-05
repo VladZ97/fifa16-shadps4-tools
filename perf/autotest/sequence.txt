@@ -1,0 +1,35 @@
+# Replayed by ~/fifa_autotest.sh run. Commands: wait <log-regex> [timeout] | key <name> [repeat] [delay] | sleep <s> | mark <text> | measure <seconds>
+# Learned 2026-10-28 on the side build (boot -> legal -> intro video -> title "PRESS X" -> main hub -> kick off -> side select -> team select -> kit select -> match)
+wait "MoviePlayer2 Decode Thread" 180
+mark "intro video started"
+sleep 20                   # intro is not skippable; ~14 s video + transition
+wait "FIFA_ATTR.vp8" 120   # title screen assets
+mark "title screen"
+sleep 5
+key options 1 2.0          # title screen accepts a held Options/Cross
+key cross 1 2.0
+wait "MainHubWidget.big" 60
+mark "main hub"
+sleep 4
+key cross 1 1.5            # Kick Off tile (first on the hub) -> side select
+sleep 4
+key cross 1 1.5            # side select -> team select
+sleep 5
+key cross 1 1.5            # team select: confirm teams (defaults: FC Barcelona vs Real Madrid)
+sleep 2
+key cross 1 1.5
+sleep 6
+key cross 1 1.5            # kit select: home side ready
+sleep 2
+key cross 1 1.5            # kit select: away side ready -> stadium card loads
+sleep 25                   # stadium card ("PRESS ANY BUTTON") appears after the kit confirm
+key cross 1 2.0            # stadium card -> Match Preview (PLAY MATCH highlighted)
+sleep 4
+key cross 1 2.0            # PLAY MATCH -> loading screen with the skill drill (do NOT press cross here)
+wait "Match kicker thread" 300
+mark "match engine started"
+sleep 15
+key options 1 2.0          # loading screen: START skips the drill and goes to the match intro
+sleep 25                   # commentary / lineup intro
+mark "in match"
+measure 60
