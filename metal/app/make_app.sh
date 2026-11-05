@@ -10,6 +10,7 @@ L=~/fifa_metal/launcher; S=~/fifa_metal/shadps4-metal/build; B=~/fifa_metal/bloo
 LIBS=(libSDL3.0.dylib libavformat.61.dylib libavcodec.61.dylib libswscale.8.dylib libswresample.5.dylib libavutil.59.dylib)
 
 echo "== launcher"; (cd "$L" && bash build.sh >/dev/null); cp -R "$L/FIFA 16.app" "$OUT/"
+rm -rf "$L/FIFA 16.app"   # the skeleton has no payload: never leave it around to be opened by mistake
 APP="$OUT/FIFA 16.app"; RES="$APP/Contents/Resources"; EMU="$RES/emulator"; HLP="$APP/Contents/Helpers"
 mkdir -p "$EMU" "$HLP" "$RES/fifamod/tools" "$RES/fifamod/stock/data/ui/fonts"
 
