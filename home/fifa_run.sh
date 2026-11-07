@@ -20,9 +20,9 @@
 #
 # Each run writes to ~/fifa_runs/<timestamp>/ : emulator.log, shots/*.jpg, stats.txt, config.json (copy)
 
-EMU="/Users/me/Library/Application Support/shadPS4QtLauncher/versions/Custom-flipfix/shadps4"
+EMU="$HOME/Library/Application Support/shadPS4QtLauncher/versions/Custom-flipfix/shadps4"
 GAME="/Volumes/SanDiskSSD/F16_02138_extracted/F16_02138/FIFA 16 - CUSA02138 + Update 1.07/FIFA_16/CUSA02138/eboot.bin"
-CFG="/Users/me/Library/Application Support/shadPS4/config.json"
+CFG="$HOME/Library/Application Support/shadPS4/config.json"
 RUNS="$HOME/fifa_runs"
 : ${KK_FLAGS="image_view_min_lod,custom_border"}
 : ${SHOT_EVERY=20}
