@@ -99,3 +99,17 @@ missing keys and `--cli set`; the checklist for every folder state; the exact en
 passes (golden table, default and every option); a launch through a stub run.sh that records
 the environment it got; Stop against throw-away processes (wrong name refused, children
 cleaned); `ps` parsing, the log tail and state.json.
+
+## Mods (side menu)
+
+The Mods page does everything the `fifamod` command line does, with nothing to install: the app
+bundles the compiled engine (`Resources/fifamod/engine`, built by `~/fifa_metal/app/make_engine.sh`
+with python.org's Python so every file loads on old macOS), `7zz` and the stock lists.
+`Model/ModLibrary.swift` locates the library and runs the engine; `App/ModsModel.swift` and
+`App/ModsView.swift` are the page. Mods are optional: the `Use mods` switch (also on the Mods
+folder row) makes Play pass no overlay, and run.sh then points the `-mods` lookup at an empty
+folder. The registry and merged tree stay on APFS in the data folder (`mods/`); the Mods folder can
+be anywhere, or be an existing fifamod store (used in place) or a ready-made patch.
+`FIFA16_DATA_DIR=<folder>` runs the app against a separate data folder for testing. This
+toolchain's swiftc has no SwiftUI macro plugin: no `@State`; view state lives in the models.
+`FIFA_TEST_ENGINE=<work_mods/pkg/fifamod> bash build.sh --test` also drives the real engine.

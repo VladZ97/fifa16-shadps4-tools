@@ -1,31 +1,28 @@
-// FIFA 16 launcher window: game art header, the four folders and the installation checklist,
-// the options (two grouped forms, as in the Bloodborne port's launcher), the log page, and the
+// FIFA 16 launcher window: game art header, a side menu (Game, Mods, Log), the four folders and
+// the checklist with the app's own parts folded under Advanced Settings, the options, and the
 // Play/Stop bar.
 import AppKit
 import SwiftUI
 
 struct LauncherView: View {
-    static let size = CGSize(width: 900, height: 720)
+    static let size = CGSize(width: 1060, height: 760)
     @ObservedObject var model: LauncherModel
 
     var body: some View {
         VStack(spacing: 0) {
             Header(model: model)
-            Picker("", selection: $model.page) {
-                Text("Game").tag(LauncherModel.Page.game)
-                Text("Log").tag(LauncherModel.Page.log)
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .fixedSize()
-            .padding(.top, 10)
-            Group {
-                switch model.page {
-                case .game: gamePage
-                case .log: LogPage(model: model)
+            HStack(spacing: 0) {
+                SideMenu(model: model, mods: model.mods).frame(width: 150)
+                Divider()
+                Group {
+                    switch model.page {
+                    case .game: gamePage
+                    case .mods: ModsPage(model: model, mods: model.mods)
+                    case .log: LogPage(model: model)
+                    }
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
             Divider()
             bottomBar.padding()
         }
@@ -46,7 +43,12 @@ struct LauncherView: View {
                     }
                 }
                 Section("Installation") {
-                    ForEach(model.status) { item in StatusRow(item: item) }
+                    ForEach(model.chosenStatus) { item in StatusRow(item: item) }
+                }
+                Section {
+                    DisclosureGroup("Advanced Settings", isExpanded: Binding(get: { model.advancedOpen || model.bundledProblem }, set: { model.advancedOpen = $0 })) {
+                        ForEach(model.bundledStatus) { item in StatusRow(item: item) }
+                    }
                 }
             }
             .formStyle(.grouped)
@@ -144,6 +146,43 @@ struct LauncherView: View {
     }
 }
 
+private struct SideMenu: View {
+    @ObservedObject var model: LauncherModel
+    @ObservedObject var mods: ModsModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            item(.game, "Game", "gamecontroller.fill")
+            item(.mods, "Mods", "shippingbox.fill", badge: modsBadge)
+            item(.log, "Log", "doc.text.fill")
+            Spacer()
+        }
+        .padding(10)
+        .background(Color(nsColor: .underPageBackgroundColor).opacity(0.5))
+    }
+
+    private var modsBadge: String? {
+        guard model.settings.modsEnabled else { return "off" }
+        guard let state = mods.state, !state.mods.isEmpty else { return nil }
+        return String(state.enabledCount)
+    }
+
+    private func item(_ page: LauncherModel.Page, _ title: String, _ icon: String, badge: String? = nil) -> some View {
+        Button { model.page = page } label: {
+            HStack(spacing: 8) {
+                Image(systemName: icon).frame(width: 18)
+                Text(title)
+                Spacer()
+                if let badge { Text(badge).font(.caption).foregroundStyle(.secondary) }
+            }
+            .padding(.horizontal, 8).padding(.vertical, 6)
+            .contentShape(Rectangle())
+            .background(model.page == page ? Color.accentColor.opacity(0.22) : .clear, in: RoundedRectangle(cornerRadius: 6))
+        }
+        .buttonStyle(.plain)
+    }
+}
+
 private struct FolderRow: View {
     @ObservedObject var model: LauncherModel
     let folder: LauncherModel.Folder
@@ -153,11 +192,15 @@ private struct FolderRow: View {
             VStack(alignment: .leading, spacing: 1) {
                 Text(folder.title)
                 let path = model.folderPath(folder)
-                Text(model.folderIsSet(folder) ? path : "not set")
+                Text(model.folderIsSet(folder) ? path : (folder == .mods ? "optional: kept inside the app" : "not set"))
                     .font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.head)
                     .help(path.isEmpty ? folder.hint : path)
             }
             Spacer()
+            if folder == .mods {
+                Toggle("", isOn: $model.settings.modsEnabled).toggleStyle(.switch).controlSize(.small).labelsHidden()
+                    .help("Off: the game starts without any mods. Nothing is deleted.")
+            }
             if folder.clearable && model.folderIsSet(folder) {
                 Button("Clear") { model.clearFolder(folder) }
             }
@@ -173,7 +216,7 @@ private struct Header: View {
         ZStack(alignment: .bottomLeading) {
             if let image = Header.artwork(model.folders) {
                 Image(nsImage: image).resizable().aspectRatio(contentMode: .fill)
-                    .frame(width: LauncherView.size.width, height: 150).clipped()
+                    .frame(width: LauncherView.size.width, height: Self.height).clipped()
             } else {
                 LinearGradient(colors: [Color(red: 0.05, green: 0.18, blue: 0.12), Color(red: 0.02, green: 0.05, blue: 0.1)],
                                startPoint: .topLeading, endPoint: .bottomTrailing)
@@ -190,8 +233,9 @@ private struct Header: View {
             }
             .padding(16)
         }
-        .frame(width: LauncherView.size.width, height: 150)
+        .frame(width: LauncherView.size.width, height: Self.height)
     }
+    private static let height: CGFloat = 104
 
     private static var cached: [String: NSImage?] = [:]
     /// The bundled banner, else the game's own header art once a game folder is set.

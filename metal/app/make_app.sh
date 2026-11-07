@@ -12,7 +12,7 @@ LIBS=(libSDL3.0.dylib libavformat.61.dylib libavcodec.61.dylib libswscale.8.dyli
 echo "== launcher"; (cd "$L" && bash build.sh >/dev/null); cp -R "$L/FIFA 16.app" "$OUT/"
 rm -rf "$L/FIFA 16.app"   # the skeleton has no payload: never leave it around to be opened by mistake
 APP="$OUT/FIFA 16.app"; RES="$APP/Contents/Resources"; EMU="$RES/emulator"; HLP="$APP/Contents/Helpers"
-mkdir -p "$EMU" "$HLP" "$RES/fifamod/tools" "$RES/fifamod/stock/data/ui/fonts"
+mkdir -p "$EMU" "$HLP"
 
 echo "== emulator (x86-64) + libraries"
 cp "$S/shadps4" "$S/libvulkan.dylib" "$S/libvulkan_kosmickrisp.dylib" "$S/kosmickrisp_mesa_icd.json" "$EMU/"
@@ -26,8 +26,11 @@ chmod +x "$EMU/shadps4"
 
 echo "== GPU host app (arm64) + libraries"
 cp -R "$HOME/fifa_metal/host_app/FIFA 16 GPU.app" "$HLP/"; HM="$HLP/FIFA 16 GPU.app/Contents/MacOS"
-cp "$B/out/bbgpu-host" "$B/out/bbgpu-host-macos27" "$HM/"; cp "$B/out/gpu-arm64/libbbgpu.dylib" "$HM/"; for l in "${LIBS[@]}"; do cp "$B/deps/arm64/lib/$l" "$HM/"; done
-for h in "$HM/bbgpu-host" "$HM/bbgpu-host-macos27"; do
+# Three hosts: plain (macOS < 27; re-execs into -macos26 when its reservation fails), -macos26 (stub
+# with the pinned ranges + libbbhost.dylib), -macos27 (pinned ranges, code in the executable).
+cp "$B/out/bbgpu-host" "$B/out/bbgpu-host-macos27" "$B/out/bbgpu-host-macos26" "$HM/"; cp "$B/out/gpu-arm64/libbbgpu.dylib" "$B/out/gpu-arm64/libbbhost.dylib" "$HM/"; for l in "${LIBS[@]}"; do cp "$B/deps/arm64/lib/$l" "$HM/"; done
+otool -l "$HM/libbbhost.dylib" | grep -q '@loader_path' || install_name_tool -add_rpath @loader_path "$HM/libbbhost.dylib"
+for h in "$HM/bbgpu-host" "$HM/bbgpu-host-macos27" "$HM/bbgpu-host-macos26" "$HM/libbbhost.dylib"; do
     for rp in $(otool -l "$h" | awk '/LC_RPATH/{getline; getline; print $2}'); do
         case "$rp" in @*) ;; *) install_name_tool -delete_rpath "$rp" "$h" ;; esac
     done
@@ -46,7 +49,8 @@ c["Log"]["filter"] = "*:error"
 s = json.dumps(c, indent=4); assert "/Users/" not in s and "/Volumes/" not in s, "personal path in template"
 open(sys.argv[2], "w").write(s)
 PY
-cp ~/FIFA16Mods/fifamod.py ~/FIFA16Mods/README.md "$RES/fifamod/"; cp ~/FIFA16Mods/tools/hair_ps4.py ~/FIFA16Mods/tools/dds_ps4.py ~/FIFA16Mods/tools/fifadb.py "$RES/fifamod/tools/"; cp ~/FIFA16Mods/stock/data/ui/fonts/fonts.txt "$RES/fifamod/stock/data/ui/fonts/"
+# The mod manager: compiled, nothing to install (make_engine.sh; sources in ~/fifa_metal/app/engine).
+bash "$HERE/make_engine.sh"; rm -rf "$RES/fifamod"; cp -R "$HERE/work_mods/pkg/fifamod" "$RES/fifamod"; cp "$HERE/engine/README.md" "$RES/fifamod/"
 cp "$B/LICENSE" "$RES/LICENSE-bloodborne_mac_port.txt"
 
 echo "== sign"

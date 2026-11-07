@@ -8,6 +8,8 @@ struct StatusItem: Identifiable, Equatable {
     let ok: Bool
     /// Not needed to play (shown in orange when missing, never blocks Play).
     var optional = false
+    /// Part of the app itself, nothing the user chooses: listed under Advanced Settings.
+    var bundled = false
 }
 
 enum InstallStatus {
@@ -29,9 +31,9 @@ enum InstallStatus {
             items.append(StatusItem(title: "Game folder", detail: "not set: choose the dumped \(Paths.titleID) folder (eboot.bin, sce_sys/)", ok: false))
         }
         items.append(StatusItem(title: "Savegame folder", detail: savesDetail(f.saves, fm: fm), ok: savesUsable(f.saves, fm: fm)))
-        items.append(StatusItem(title: "Emulator (bundled)", detail: paths.emulator.path, ok: fm.isExecutableFile(atPath: paths.emulator.path)))
-        items.append(StatusItem(title: "GPU host (bundled)", detail: paths.hostBundle.path, ok: exists(paths.gpuHostMacOS27)))
-        items.append(StatusItem(title: "Launch script (bundled)", detail: paths.runScript.path, ok: exists(paths.runScript)))
+        items.append(StatusItem(title: "Emulator (bundled)", detail: paths.emulator.path, ok: fm.isExecutableFile(atPath: paths.emulator.path), bundled: true))
+        items.append(StatusItem(title: "GPU host (bundled)", detail: paths.hostBundle.path, ok: exists(paths.gpuHostMacOS27), bundled: true))
+        items.append(StatusItem(title: "Launch script (bundled)", detail: paths.runScript.path, ok: exists(paths.runScript), bundled: true))
 
         // Optional: update, mods, config, shader cache.
         if let update = f.update {
@@ -40,18 +42,29 @@ enum InstallStatus {
         } else {
             items.append(StatusItem(title: "Update folder", detail: "none, base game 1.00 runs", ok: false, optional: true))
         }
-        if let mods = f.mods {
-            let ok = isDir(mods)
-            items.append(StatusItem(title: "Mods folder", detail: ok ? mods.path : "\(mods.path): not found", ok: ok, optional: true))
-        } else {
-            items.append(StatusItem(title: "Mods folder", detail: "none", ok: false, optional: true))
-        }
+        items.append(modsItem(settings, paths: paths, folders: f, fm: fm))
+        items.append(StatusItem(title: "Mod manager (bundled)", detail: paths.modEngine.path, ok: fm.isExecutableFile(atPath: paths.modEngine.path),
+                                optional: true, bundled: true))
         let config = exists(paths.config)
-        items.append(StatusItem(title: "Emulator config", detail: config ? paths.config.path : "created on first Play", ok: config, optional: true))
+        items.append(StatusItem(title: "Emulator config", detail: config ? paths.config.path : "created on first Play", ok: config, optional: true, bundled: true))
         let cacheFiles = (try? fm.contentsOfDirectory(atPath: paths.shaderCache.path))?.filter { !$0.hasPrefix(".") }.count ?? 0
         items.append(StatusItem(title: "Shader cache", detail: cacheFiles > 0 ? "\(cacheFiles) files" : "empty, first sessions compile shaders",
-                                ok: cacheFiles > 0, optional: true))
+                                ok: cacheFiles > 0, optional: true, bundled: true))
         return items
+    }
+
+    /// Mods are optional: having none, or switching them off, is as fine as having some.
+    static func modsItem(_ settings: LauncherSettings, paths: Paths, folders f: GameFolders, fm: FileManager) -> StatusItem {
+        func item(_ detail: String, ok: Bool = true) -> StatusItem { StatusItem(title: "Mods folder", detail: detail, ok: ok, optional: true) }
+        guard settings.modsEnabled else { return item("off: the game runs without mods") }
+        if let chosen = f.mods, !fm.fileExists(atPath: chosen.path) { return item("\(chosen.path): not found", ok: false) }
+        let library = ModLibrary.locate(settings: settings, paths: paths, fm: fm)
+        if library.kind == .plainPatch { return item("\(library.patchFolder?.path ?? ""): ready-made patch") }
+        guard let registry = library.registrySummary() else { return item(f.mods?.path ?? "none") }
+        if let base = registry.base, !base.isEmpty, !fm.fileExists(atPath: base) { return item("base patch not found: \(base)", ok: false) }
+        let count = registry.mods?.count ?? 0
+        if count > 0, let dir = registry.modsDir, !fm.fileExists(atPath: dir) { return item("mods not found (drive connected?): \(dir)", ok: false) }
+        return item(count == 1 ? "1 mod installed" : "\(count) mods installed")
     }
 
     /// The savegame folder exists and is writable, or can be created (its nearest existing parent is writable).

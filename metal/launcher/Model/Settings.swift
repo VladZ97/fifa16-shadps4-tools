@@ -17,8 +17,10 @@ struct LauncherSettings: Codable, Equatable {
     var gameDir = ""
     /// Folder of update 1.07 (eboot.bin or sce_sys/ inside); empty: the base game runs.
     var updateDir = ""
-    /// The mods / patch overlay folder the game sees as /download0; empty: none.
+    /// Where mods are kept, or an existing library or patch folder (ModLibrary); empty: the app's data folder.
     var modsDir = ""
+    /// Off: the game runs without any mods, whatever is installed.
+    var modsEnabled = true
     /// Savegames; empty: <data dir>/saves.
     var savesDir = ""
     /// BB_FULLSCREEN (run.sh default 1).
@@ -38,7 +40,7 @@ struct LauncherSettings: Codable, Equatable {
     /// The folder variables, always set (empty when unset) so run.sh never sees a stale value.
     static let folderKeys = ["FIFA_APP", "FIFA_DATA_DIR", "FIFA_GAME_DIR", "FIFA_UPDATE_DIR", "FIFA_MODS_DIR", "FIFA_SAVES_DIR"]
     /// The keys `--cli set` accepts.
-    static let settableKeys = ["gameDir", "updateDir", "modsDir", "savesDir", "fullscreen", "lowLatency", "frameStats", "metalHUD", "mode"]
+    static let settableKeys = ["gameDir", "updateDir", "modsDir", "modsEnabled", "savesDir", "fullscreen", "lowLatency", "frameStats", "metalHUD", "mode"]
 
     init() {}
 
@@ -48,6 +50,7 @@ struct LauncherSettings: Codable, Equatable {
         gameDir = try c.decodeIfPresent(String.self, forKey: .gameDir) ?? ""
         updateDir = try c.decodeIfPresent(String.self, forKey: .updateDir) ?? ""
         modsDir = try c.decodeIfPresent(String.self, forKey: .modsDir) ?? ""
+        modsEnabled = try c.decodeIfPresent(Bool.self, forKey: .modsEnabled) ?? true
         savesDir = try c.decodeIfPresent(String.self, forKey: .savesDir) ?? ""
         fullscreen = try c.decodeIfPresent(Bool.self, forKey: .fullscreen) ?? true
         frameStats = try c.decodeIfPresent(Bool.self, forKey: .frameStats) ?? false
@@ -74,7 +77,7 @@ struct LauncherSettings: Codable, Equatable {
             "FIFA_DATA_DIR": paths.dataDir.path,
             "FIFA_GAME_DIR": f.game?.path ?? "",
             "FIFA_UPDATE_DIR": f.update?.path ?? "",
-            "FIFA_MODS_DIR": f.mods?.path ?? "",
+            "FIFA_MODS_DIR": modsEnabled ? ModLibrary.locate(settings: self, paths: paths).overlay()?.path ?? "" : "",
             "FIFA_SAVES_DIR": f.saves.path,
         ]
     }
@@ -102,6 +105,7 @@ struct LauncherSettings: Codable, Equatable {
         case "gameDir": gameDir = value
         case "updateDir": updateDir = value
         case "modsDir": modsDir = value
+        case "modsEnabled": modsEnabled = try bool()
         case "savesDir": savesDir = value
         case "fullscreen": fullscreen = try bool()
         case "lowLatency": lowLatency = try bool()

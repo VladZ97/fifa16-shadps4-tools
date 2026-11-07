@@ -798,3 +798,182 @@ RangeSet::ForEachInRange fix (7deb4ed), 1 ms keyboard poll (shadps4-metal, uncom
 re-signed (refresh.sh + restore.sh re-sign). Snapshot /Volumes/SanDiskSSD/fifa_side/playable_20261104b (restore.sh),
 tags playable-20261104b. Open: the Metal HUD reads "Composited" in captures now (latency unchanged at 24 ms); whether
 direct scan-out still engages outside captures is unverified.
+
+## 2026-11-06 — app on a second Mac (macOS < 27): GPU host cannot reserve the low guest range (OPEN)
+"cannot reserve the guest range 0x400000000-0xfa0000000 (got 0xfc00000000)", host status 12. Before macOS 27 the
+emulator starts the plain bbgpu-host (no exec-time segments), which reserves the ranges with an mmap hint. The low
+range (fifa-hybrid) lies inside the dyld shared region's submap ([0x180000000, 0xfc0000000); past the cache end it is
+one PROT_NONE never-touched entry on 27.0.1), so the hint can never get it: the plain host never worked with the low
+range, unnoticed because this Mac runs the -macos27 host. A fix was tried (no-segment path of reserve_range: walk the
+range with mach_vm_region_recurse, take it with MAP_FIXED if it holds only that unused tail; worked in a low-range-only
+test host on 27) and REVERTED the same night at the user's request (graphics reported broken in the v0.3.1 app; the
+change did not touch the -macos27 path beyond a log call, cause not established). host/main.c = HEAD again, hosts
+rebuilt, app/out restored from FIFA16-macOS-v0.3.0.zip. app/out/"FIFA 17.app" is a copy of the v0.3.1 build (user's).
+
+## 2026-11-06 — app: saves fail when the launcher's Update folder is set (OPEN, not a permission problem)
+Run 20261106_021149: "Failed to open ... CUSA02138-UPDATE/data, Is a directory" then "Opening /savedata0/DATA failed,
+backend did not serve the file"; the slot got a 0-byte INDEX and no DATA. Cause: fs.cpp OverlayPath returns
+SHAD_UPDATE_DIR for the -UPDATE/-patch probe of EVERY mount (GetHostPath ~l.349), so /savedata0/DATA resolves to the
+update folder's "data" directory; /download0 (mods) is searched in the update folder first as well, so update files
+shadow mod files (possible cause of wrong graphics with mods in the app; unverified). Dev run.sh does not set the
+variable. Fix idea: apply the override only when the mount is /app0 (or /hostapp). Old saves
+(~/Library/Application Support/shadPS4/home) copied into ~/Library/Application Support/FIFA 16/saves; the failed
+slot moved to .../FIFA 16/saves-failed-20261106.
+
+## 2026-11-06 11:00 — macOS 26 host fix, second attempt (delivered as v0.3.2 candidate, NOT yet run on macOS 26)
+Constraint: do not break the game. So the app is v0.3.0 with ONE file replaced, the plain bbgpu-host (the one the
+emulator starts before macOS 27; gpu_process.c host_path picks "<host>-macos27" on 27+, so this Mac never runs it).
+- Code: host/guest_takeover.h (new) + 7 lines in host/main.c reserve_range, only in the branch for a host built
+  without the segment: hint first as before; if not honoured, walk the range (mach_vm_region_recurse); if it holds
+  only unused reservation inside a submap (PROT_NONE, never touched) or nothing, take it with MAP_FIXED (mach_vm_map
+  FIXED|OVERWRITE as fallback), verify, log; anything in use is named and refused. Test: host/tests/takeover_test.m
+  (take / block / walk). Source changes are UNCOMMITTED; dev out/ hosts and host_app were not rebuilt.
+- Findings on 27.0.1: plain process: low range = one nested unused entry 0x352af8000-0xfc0000000, hint lands in the
+  high area, takeover works; mirrors (mach_vm_map of a memory entry at 0x406200000, 0x469d00000, ...), no-copy
+  MTLBuffers on them, compute read/write, buffer and texture blits all correct. A process WITH the pinned __GUESTRSV
+  segment has NO shared-region tail in the low range at all (hint honoured): so a full-game run of the takeover path
+  is impossible on 27 (the plain host cannot get the HIGH range here: xzone malloc regions sit in it).
+- Last time's "broken graphics" (v0.3.1): all four logged app runs on this Mac used bbgpu-host-macos27 with the same
+  reservation lines; v0.3.0 and the v0.3.2 candidate both render a match correctly at 60 fps in an isolated data
+  folder (work26 harness). Cause of that report not found; it was not the host change. "Update shadows mods" is NOT
+  supported: only 3 AppleDouble junk paths overlap between CUSA02138-UPDATE and ~/FIFA16Mods/merged. The saves bug
+  with the Update folder set (fs.cpp:349, update overlay searched for every mount) is real and still open.
+- Harness: ~/fifa_metal/app/work26 (app_runner.sh + autotest_app.sh target "app": isolated FIFA_DATA_DIR and a copy
+  of the saves; keyboard mapping must be copied into <data>/user/input_config, and in the app's emulator build cross
+  is keypad 2, so the copy sends key codes 84/88; HOST_PROC_NAME for a differently named host). make_candidate.sh,
+  compare_apps.py (bundle diff ignoring code signatures).
+- Delivered: ~/fifa_metal/app/out26/FIFA 16.app + FIFA16-macOS-v0.3.2.zip; SSD: "FIFA 16 v0.3.2.app" beside the
+  untouched "FIFA 16.app", and FIFA16-macos26-check (the takeover test). ~/Applications and app/out untouched.
+
+## 2026-11-06 12:00 — v0.4.0: mods inside the app (side menu, compiled engine, optional)
+App = v0.3.2 (out26) with only the launcher, run.sh and Resources/fifamod replaced (make_mods_app.sh; emulator, hosts and
+libraries byte-identical). Engine: ~/fifa_metal/app/engine = git worktree of ~/FIFA16Mods, branch app-engine, UNCOMMITTED;
+live ~/FIFA16Mods/fifamod.py untouched. New in the engine: FIFAMOD_APP (no shadPS4 links, no -mods sibling unless it
+exists), FIFAMOD_RESOURCES, FIFAMOD_7ZZ, optional base patch, configure/state/details (JSON), check_source (refuses
+system folders, apps, too little disk), SIGTERM cancel. Parity with the live tool: 11,719 merged entries identical.
+make_engine.sh compiles with python.org 3.10 (pyenv/Homebrew Python pulls Homebrew dylibs with minos 27: would not load
+on macOS 26). Launcher: Model/ModLibrary.swift, App/ModsModel.swift, App/ModsView.swift; side menu; Use mods switch
+(settings.modsEnabled; off = no overlay and run.sh points SHAD_MODS_DIR at an empty folder, else <game>-mods stays active);
+Advanced Settings folds the bundled items; Edit menu got Cut/Paste/Undo (Paste never worked). 126 model checks incl. real engine.
+Matches (isolated data): off = stock game; full library = La Liga scoreboard, Camp Nou, 60 fps; fresh library without
+base = UCL scoreboard on the stock game. Not tested: Career saves with mods off; macOS 26; drag and drop by hand; Update
+folder saves bug (fs.cpp:349) still open. GUI test notes: keyboard layout breaks `keystroke`, use key codes; synthetic
+`click at` misses Form rows, use real CGEvents (work_mods/mouse).
+
+## 2026-11-06 23:30 — macOS 26 host, third attempt (v0.4.1): stub executable + libbbhost.dylib, plain host re-execs
+The user's macOS 26 run of v0.4.0: low range 0x400000000-0xfa0000000 refused, "4 mapping(s) in use": libmalloc's
+xzone reservation (12300 MiB + two 4 MiB tag-2 regions + 12268 MiB = ~24 GiB, random address) sat at 0x642000000;
+on 27 the same reservation lands in the HIGH range (that is why only the -macos27 host works here). No Malloc* env
+setting removes it (MallocSecureAllocator=0, MallocNanoZone=0 tried). The takeover from v0.3.2 cannot help: the
+regions are live heap. Exec-time segments are the only way to get a range before libmalloc; PR #7 found that on 26
+a pinned/4 GiB+ zero-fill segment in an executable WITH CODE breaks dyld's flat-namespace lookups into that
+executable (libbbgpu.dylib's -undefined dynamic_lookup of the 22 runtime_* callbacks).
+- Fix: bbgpu-host-macos26 = host/stub_main.c (one call) + the two pinned segments; all code in
+  out/gpu-arm64/libbbhost.dylib (main.c with -DBBGPU_HOST_MAIN=bbgpu_host_main + host_runtime.c), so no lookup
+  targets the executable. The plain bbgpu-host (what the emulator starts before 27) is unchanged until its
+  reservation fails; then reexec_segment_host() execv()s the -macos26 sibling (same pid, env BBGPU_HANDSHAKE, stdout
+  pipe, registered handshake port all survive exec: verified by a full match on 27 with -macos27 removed from a test
+  bundle: "becoming ...-macos26", handshake done, La Liga match 60 fps). Loop guard BBGPU_REEXEC=1.
+- Emulator, bbgpu-host-macos27 and libbbgpu.dylib untouched (compare_apps: bbgpu-host differs, two files added).
+  ~/fifa_metal/build_host.sh builds all three; make_app.sh ships them; app/make_host26_app.sh <ver> [base] [--no-macos27]
+  patches a base app (default out_mods v0.4.0) -> out_host26 + zip. SSD: "FIFA 16 v0.4.1.app".
+- Not verifiable here: dyld on 26 loading the stub (the reporter's 1 GiB pinned test segfaulted before main; the
+  4 GiB+ ones only failed the lookup). First signal on the 26 Mac: run
+  ".../FIFA 16 v0.4.1.app/Contents/Helpers/FIFA 16 GPU.app/Contents/MacOS/bbgpu-host-macos26" by hand: expect
+  "pid ..., native arm64" + "not started by bb-probe"; a dyld error there means the stub approach is dead on 26.
+- Pre-existing quirk seen on the way: the bundled libbbgpu.dylib carries an absolute LC_RPATH to this Mac's
+  deps/arm64/lib, so on THIS Mac the shipped host loads SDL/ffmpeg from the dev tree (other Macs: bundle copies).
+
+## 2026-11-07 — macOS 26 host, fourth attempt (v0.4.2): no flat-namespace lookups at all
+v0.4.1 on the 26 Mac: re-exec worked ("becoming ...-macos26"), then dyld: "symbol not found in flat namespace
+'_runtime_disabled_optimizations'" although the symbol was in libbbhost.dylib. So on 26 a pinned-segment executable
+breaks EVERY flat lookup in the process, not only those into the executable. v0.4.2: libbbhost.dylib = the renderer's
+own arm64 objects (out/gpu-arm64, current per ninja -n, bit-identical to the shipped libbbgpu.dylib bar 2 header
+bytes) linked with the same CMake link line minus the -Wl,-U,_runtime_* flags, plus host/main.c + host_runtime.c:
+no undefined runtime_* left (nm -u), no libbbgpu dependency; the stub links only libbbhost. ~/fifa_metal/build_host26.sh
+(called from build_host.sh). Verified on 27 via --no-macos27 package: re-exec, handshake, La Liga match, 60 fps.
+Still untested on 26. make_host26_app.sh zip bug fixed (pipefail on the smoke run). SSD: "FIFA 16 v0.4.2.app".
+
+## 2026-11-07 — v0.4.3: macOS 26 host still dies in dyld; in-process fallback + loader probe kit
+v0.4.2 on the 26 Mac: "becoming ...-macos26" then the stub died with SIGTRAP (status 0x5), no dyld message: past
+symbol binding this time, before main's first say(). So macOS 26's dyld breaks a pinned-segment executable in more
+than one way (PR #7's 1 GiB pinned test also died pre-main). Nothing more to guess from here; two things instead:
+- Fallback in app/run.sh play: after launch, wait up to 10 s for "GPU process: host pid" (ok) or "the GPU process
+  could not start"; on the latter, unless SHAD_BBGPU_SPLIT was given explicitly (SHAD_BBGPU_SPLIT_SET), relaunch with
+  SHAD_BBGPU_SPLIT=0 (renderer inside the emulator, x86 under Rosetta: the pre-split path; first log kept as
+  emulator-gpu-host.log). Verified on 27 with BB_GPU_HOST=<plain stub that cannot reserve>: fallback kicked in,
+  "renderer started on the window's Metal layer", boots at 60 fps. Full in-process match: see below.
+- Probe kit on the SSD: FIFA16-host26-kit/run.command runs stub0 (no segment), stub1 (pinned both = v0.4.2), stub4
+  (pinned low only), stub7 (__TEXT at 0x300000000 + pinned both), stub8 (pinned 1 GiB each), with DYLD_PRINT_* traces,
+  collects ~/Library/Logs/DiagnosticReports/stub*.ips into results/. All five reach main on 27. ld refuses __TEXT above
+  the pinned ranges ("address is out of order") and a huge unpinned segment cannot start above the shared cache.
+- host/main.c reserve_range now also accepts any __GUEST* segment covering the range (for layouts where one segment
+  covers both). Scan of all 34 Malloc* env switches on 27: none removes the 24 GiB reservation.
+- make_host26_app.sh now also copies app/run.sh. SSD: "FIFA 16 v0.4.3.app" (= v0.4.2 + run.sh); harness
+  autotest_app.sh honours a preset SHAD_BBGPU_SPLIT for the app target.
+
+## 2026-11-07 — v0.4.4: the macOS 26 cause found (libmalloc), 20 GiB low reservation
+Kit results from the 26 Mac (26.3, 17 GB; app/work_mods/host26/results_26_run1): stub1/4/7 (46.5 GiB low segment)
+die in libSystem_initializer -> __malloc_init -> xzm_main_malloc_zone_init_range_groups: "BUG IN LIBMALLOC: pointer
+range initial reservation failed" (SIGTRAP, .ips asi). stub8 (1 GiB pins) reaches main. So macOS 26's xzone malloc
+needs a 24 GiB window BELOW 64 GiB at process start (every reservation seen on 26 ends under 0x1000000000) and
+aborts without it; 27's malloc goes elsewhere (0x7xxxxxxxxx). Not dyld at all. v0.4.3's fallback worked on 26:
+in-process renderer, match at 30-33 fps (user's emulator.log).
+- Fix: host/guest_reservation_low26.s = 20 GiB __GUESTLOW (0x400000000-0x900000000): covers the system managed area
+  above the base (16 GiB) plus 4 GiB; [0x900000000, 0x1000000000) = 28 GiB stays free for libmalloc. main.c
+  reserve_range takes the covered part only and sets bbgpu_low_reserved_max; host_view_apply refuses views beyond it
+  (one say() + fail_view E2BIG). Game data: highest low-range GPU protect address seen 0x4717ff000 (+1.8 GiB).
+- On 27 via --no-macos27 package: re-exec, "segment covers it up to 0x900cdc000 (20 GiB)", La Liga match 60 fps, zero
+  refused views. v0.4.4 = v0.4.3 files + new bbgpu-host-macos26/libbbhost; SSD "FIFA 16 v0.4.4.app"; kit on the SSD
+  now has stub9 (20 GiB low + high pinned = v0.4.4's layout) and stub10 (20 GiB low only). If stub9 traps on 26 but
+  stub10 passes, drop the high pin (the hint worked for the high range on 26 in all three user logs).
+
+## 2026-11-07 — v0.4.5: SDK 12 stamp makes libmalloc skip the xzone pointer range (the actual fix)
+Kit run 2 on the 26 Mac: stub9 (20 GiB low + high) and stub10 (20 GiB low only) abort the same way; only the 1 GiB
+pins pass. So any sizeable pin below 64 GiB loses against 26's xzone "pointer range" (random placement, few tries).
+Finding on 27: libmalloc chooses the allocator by the MAIN EXECUTABLE's linked SDK (LC_BUILD_VERSION sdk): stamped
+sdk 12.0 (-Wl,-platform_version,macos,15.0,12.0; sdk 13/14 still xzone) a process has NO malloc regions in either
+guest range (takeover_test walk: 0 in use), i.e. no pointer range at all. Applied to the plain bbgpu-host and to
+bbgpu-host-macos26 (full 46.5 GiB low segment again; the partial-reservation code stays, unused). -macos27, emulator,
+libbbgpu untouched (sdk 27). On 27 the stamped PLAIN host now reserves both ranges by itself (high via hint, low via
+takeover) - re-exec no longer needed here; both paths played a full match (--no-macos27 package, and BB_GPU_HOST=stub):
+La Liga, 60 fps, screenshots fine, so the old-SDK stamp does not disturb Metal/SDL. Kit: stub11 (sdk12 pinned both),
+stub12 (sdk12 no segment: shows whether the hints work on 26). SSD: "FIFA 16 v0.4.5.app". Untested on 26 as of writing.
+Caveat: "linked before macOS 13" compatibility paths in system frameworks apply to the host process; nothing seen.
+
+## 2026-11-07 — v0.4.6: saves fix (emulator), isolation from other shadPS4 installs, no migration prompt
+v0.4.5 runs with the native host on the 26 Mac (user: "runs perfect now"); the game then "cannot save and exits".
+Not permissions: the update-overlay bug (fs.cpp GetHostPath applied the -UPDATE/-patch overlay to EVERY mount, so
+/savedata0/DATA resolved into <update folder>/data, a directory on case-insensitive volumes). Reproduced here with an
+empty saves folder: INDEX 0 bytes, no DATA. Fix: the update overlay only for /app0 and /hostapp paths (as -mods
+already was). Emulator rebuilt (ninja, tree = HEAD + fs.cpp + user_manager.cpp; shipped binary was bit-identical
+to the previous build bar signature/uuid bytes).
+Isolation audit (user asked that the app never touches another shadPS4 install): the renderer library's own
+path_util (bloodborne port copy, in the x86 emulator AND the arm64 host) ignores SHAD_USER_DIR and was writing
+shader caches (1082 files), the Metal cache and custom_trophy/Notice.txt to ~/Library/Application Support/shadPS4.
+It honours BB_GPU_USER_DIR: run.sh exports BB_GPU_USER_DIR=$DATA/user and BB_CAPTURE_DIR=$DATA/captures. run.sh
+also no longer pkills every shadps4/bbgpu-host on the Mac: own_emulators()/own_hosts() match this bundle's paths;
+the launcher's "Another shadPS4 is running" alert leaves it running ("Play Anyway"). Nothing is read from another
+install (the app ran on a Mac without shadPS4).
+"Save Migration" SDL prompt (user_manager.cpp, shown on the first run with a fresh saves folder, before looking for
+old files): removed, TransferOption::Nothing. The launcher's saves folder is the only save location.
+make_host26_app.sh: WITH_EMULATOR=1 / WITH_LAUNCHER=1 copy the rebuilt emulator (rpaths fixed) / launcher.
+Harness note: never `pkill -f autotest_app.sh` from a command whose own line contains that string (kills itself).
+
+## 2026-11-07 — v0.4.7: FIP 9.0 install (multi-part RAR, 44 GiB unpack, unrar), "kit file inappropriate"
+User: installing the FIP archives fails with "something about a kit file being inappropriate". Reproduced with the
+compiled engine in a scratch library (store APFS, mods folder on the SSD): (1) the engine always unpacked into the
+store's .tmp on the internal disk: FIP 9.0 unpacks to 44.1 GiB (109,811 files), the Mac had 23 GiB -> "No space
+left"; (2) then bsdtar ran as fallback and died at the 2 GiB volume boundary (kitnumbers_489_10.rx3: "Too small
+block encountered: Inappropriate file type or format") - the message the user saw, hiding the real error; (3) the
+real error: 7-Zip 23.01 (Homebrew) reports "Unsupported Method" for 92,751 entries of the main V9.0 archive (RAR5
+m3:24), while RARLAB's unrar 6.12 (Caskroom) decodes it; face packs and V9.x updates are m3:23 and fine with 7zz.
+Engine: first_volume() (partN.rar / .rNN / .7z.NNN -> first part, mod name without the suffix, refuses an orphan
+part), archive_unpacked_size() (7zz l summary), pick_tmp_base() (unpack on the library's volume when it has
+room, else the mods folder's volume - the move then is a rename; refuses with both numbers), clear_tmp() cleans
+both, extract(): bundled unrar first for .rar (FIFAMOD_UNRAR), no bsdtar for multi-part, all extractor errors
+reported. make_engine.sh bundles unrar + LICENSE-unrar.txt (license 3a: UnRAR components may be distributed
+separately). Launcher: ModEngine.firstVolume (queue a volume set once), FIFAMOD_UNRAR in the environment.
+Tests: 136 (multi-volume 7z from part 3, orphan part refused, firstVolume patterns). v0.4.7 = v0.4.6 + engine;
+SSD "FIFA 16 v0.4.7.app". FIP 9.0 full install into the scratch library (fifa_side/fiptest) running at the time
+of writing; its result decides whether v0.4.7 stands.

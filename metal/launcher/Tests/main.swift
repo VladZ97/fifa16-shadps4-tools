@@ -17,6 +17,13 @@ func check(_ condition: @autoclosure () -> Bool, _ what: String, line: Int = #li
 }
 
 let fm = FileManager.default
+final class LineBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var lines: [String] = []
+    func add(_ line: String) { lock.withLock { lines.append(line) } }
+    var all: [String] { lock.withLock { lines } }
+}
+
 let scratch = fm.temporaryDirectory.appendingPathComponent("fifa-launcher-tests-\(getpid())")
 try? fm.removeItem(at: scratch)
 defer { try? fm.removeItem(at: scratch) }
@@ -110,13 +117,14 @@ do {
     var items = InstallStatus.check(paths, settings: s)
     func item(_ title: String) -> StatusItem? { items.first { $0.title == title } }
     check(items.map(\.title) == ["Game folder", "Savegame folder", "Emulator (bundled)", "GPU host (bundled)", "Launch script (bundled)",
-                                 "Update folder", "Mods folder", "Emulator config", "Shader cache"], "checklist order")
+                                 "Update folder", "Mods folder", "Mod manager (bundled)", "Emulator config", "Shader cache"], "checklist order")
+    check(items.filter(\.bundled).map(\.title) == ["Emulator (bundled)", "GPU host (bundled)", "Launch script (bundled)", "Mod manager (bundled)", "Emulator config", "Shader cache"], "the app's own parts go under Advanced Settings")
     check(item("Game folder")?.ok == false && item("Game folder")?.optional == false, "no game folder blocks Play")
     check(item("Savegame folder")?.ok == true, "default saves folder can be created")
     check(item("Savegame folder")?.detail.contains("created on first Play") == true, "default saves folder reported as to be created")
     check(item("Emulator (bundled)")?.ok == true && item("GPU host (bundled)")?.ok == true && item("Launch script (bundled)")?.ok == true, "bundled payload found")
     check(item("Update folder")?.ok == false && item("Update folder")?.optional == true && item("Update folder")?.detail == "none, base game 1.00 runs", "no update is optional")
-    check(item("Mods folder")?.optional == true && item("Mods folder")?.detail == "none", "no mods is optional")
+    check(item("Mods folder")?.optional == true && item("Mods folder")?.ok == true && item("Mods folder")?.detail == "none", "no mods is optional and no warning")
     check(item("Emulator config")?.ok == false && item("Emulator config")?.optional == true, "config created on first Play")
     check(item("Shader cache")?.optional == true, "shader cache is optional")
     check(InstallStatus.problems(items).map(\.title) == ["Game folder"], "only the game folder blocks")
@@ -182,7 +190,7 @@ do {
     env = s.launchEnvironment(base: base, paths: paths)
     var golden2 = golden
     golden2["FIFA_UPDATE_DIR"] = "/games/CUSA02138-UPDATE"
-    golden2["FIFA_MODS_DIR"] = ("~/mods" as NSString).expandingTildeInPath
+    golden2["FIFA_MODS_DIR"] = "" // a folder for mods, not built yet: nothing to hand to the game
     golden2["FIFA_SAVES_DIR"] = "/saves"
     golden2["BB_FULLSCREEN"] = "0"; golden2["BB_PRESENT_MODE"] = "Immediate"; golden2["BB_FRAME_STATS"] = "1"; golden2["MTL_HUD_ENABLED"] = "1"
     check(env == golden2, "every option and folder: \(env)")
@@ -192,11 +200,154 @@ do {
     check(GameControl.runDirectory(inOutput: "nothing") == nil, "no run dir")
 }
 
+// MARK: Mod library: where it is, what the game gets, the switch
+do {
+    func dir(_ name: String) -> URL {
+        let url = scratch.appendingPathComponent("lib/\(name)")
+        try? fm.createDirectory(at: url, withIntermediateDirectories: true)
+        return url
+    }
+    func env(_ s: LauncherSettings) -> String? { s.folderEnvironment(paths: paths)["FIFA_MODS_DIR"] }
+    func modsItem(_ s: LauncherSettings) -> StatusItem? { InstallStatus.check(paths, settings: s).first { $0.title == "Mods folder" } }
+    var s = LauncherSettings()
+    check(s.modsEnabled, "mods switch on by default")
+    check(try! JSONDecoder().decode(LauncherSettings.self, from: Data("{}".utf8)).modsEnabled, "an older settings file keeps mods on")
+    var library = ModLibrary.locate(settings: s, paths: paths)
+    check(library.kind == .managed && library.store == paths.modStore && library.modsFolder == nil, "not set: library in the data folder")
+    check(library.overlay() == nil && env(s) == "", "nothing built: the game gets no overlay")
+    check(modsItem(s)?.ok == true, "no library is fine")
+
+    // An existing fifamod store, chosen by its merged tree (what v0.3 settings hold).
+    let store = dir("store")
+    let merged = store.appendingPathComponent("merged")
+    try? fm.createDirectory(at: merged, withIntermediateDirectories: true)
+    fm.createFile(atPath: merged.appendingPathComponent(ModLibrary.marker).path, contents: Data())
+    let modsOnDrive = dir("drive/mods")
+    let registry = "{\"base\": \"\", \"mods_dir\": \"\(modsOnDrive.path)\", \"mods\": [\"a\", \"b\"]}"
+    fm.createFile(atPath: store.appendingPathComponent("mods.json").path, contents: Data(registry.utf8))
+    s.modsDir = merged.path
+    library = ModLibrary.locate(settings: s, paths: paths)
+    check(library.store.path == store.path && library.modsFolder == nil, "a merged tree: its store is used in place")
+    check(env(s) == merged.path, "the merged tree goes to the game")
+    check(modsItem(s)?.detail == "2 mods installed", "status counts mods")
+    s.modsEnabled = false
+    check(env(s) == "", "switch off: no overlay, whatever is installed")
+    check(modsItem(s)?.ok == true && modsItem(s)?.detail.hasPrefix("off") == true, "switch off is not a warning")
+    check(InstallStatus.problems(InstallStatus.check(paths, settings: s)).filter { $0.title == "Mods folder" }.isEmpty, "switch off never blocks")
+    s.modsEnabled = true
+    s.modsDir = store.path
+    check(ModLibrary.locate(settings: s, paths: paths).store.path == store.path, "a folder with mods.json: used in place")
+    try? fm.removeItem(at: modsOnDrive)
+    check(modsItem(s)?.ok == false && modsItem(s)?.detail.contains("drive connected") == true && modsItem(s)?.optional == true, "mods drive gone: warned, Play not blocked")
+
+    let patch = dir("patch")
+    try? fm.createDirectory(at: patch.appendingPathComponent("data"), withIntermediateDirectories: true)
+    s.modsDir = patch.path
+    library = ModLibrary.locate(settings: s, paths: paths)
+    check(library.kind == .plainPatch && library.patchFolder?.path == patch.path && env(s) == patch.path, "a folder with data/: a ready-made patch")
+    let plain = dir("plain")
+    s.modsDir = plain.path
+    library = ModLibrary.locate(settings: s, paths: paths)
+    check(library.kind == .managed && library.store == paths.modStore && library.modsFolder?.path == plain.path, "any other folder: mods kept there, store stays on the Mac")
+
+    s.gameDir = "/games/CUSA02138"
+    check(ModEngine.prepareCommands(library: library, settings: s) == [["configure", "--game", "/games/CUSA02138", "--mods-dir", plain.path]], "first change creates the registry")
+    let env1 = ModEngine.environment(library: library, paths: paths, home: "/Users/test")
+    check(env1["FIFAMOD_APP"] == "1" && env1["FIFAMOD_STORE"] == paths.modStore.path && env1["PATH"] == "/usr/bin:/bin"
+          && env1["FIFAMOD_7ZZ"] == paths.sevenZip.path && env1["FIFAMOD_UNRAR"] == paths.unrar.path && env1["FIFAMOD_RESOURCES"] == paths.modResources.path, "engine environment: nothing from the shell")
+
+    let log = dir("log").appendingPathComponent("emulator.log")
+    fm.createFile(atPath: log.path, contents: Data("x\n[K] Scoreboard: competition 53\nScoreboard: competition 223\nScoreboard: competition 53\nScoreboard: competition 0\n".utf8))
+    check(ModEngine.competitions(inLog: log) == [223, 53], "competitions from the log, newest last, 0 ignored")
+}
+
+// MARK: Multi-part archives queue as one, by the first part
+do {
+    let d = URL(fileURLWithPath: "/m")
+    check(ModEngine.firstVolume(d.appendingPathComponent("Mod.part2.rar")).lastPathComponent == "Mod.part1.rar", "first volume: partN.rar")
+    check(ModEngine.firstVolume(d.appendingPathComponent("Mod.part07.RAR")).lastPathComponent == "Mod.part01.rar", "first volume: zero-padded part")
+    check(ModEngine.firstVolume(d.appendingPathComponent("Mod.r03")).lastPathComponent == "Mod.rar", "first volume: old-style .rNN")
+    check(ModEngine.firstVolume(d.appendingPathComponent("Mod.7z.002")).lastPathComponent == "Mod.7z.001", "first volume: .7z.NNN")
+    check(ModEngine.firstVolume(d.appendingPathComponent("Mod.rar")).lastPathComponent == "Mod.rar", "first volume: a plain archive is unchanged")
+    check(ModEngine.firstVolume(d.appendingPathComponent("Party.rar")).lastPathComponent == "Party.rar", "first volume: 'part' in a name is not a volume")
+}
+
+// MARK: The compiled engine (FIFA_TEST_ENGINE=<dir with fifamod, 7zz, stock/>)
+if let root = ProcessInfo.processInfo.environment["FIFA_TEST_ENGINE"] {
+    let engine = URL(fileURLWithPath: root).appendingPathComponent("engine/fifamod")
+    let store = scratch.appendingPathComponent("engine-store")
+    let lib = ModLibrary(kind: .managed, store: store, modsFolder: nil, patchFolder: nil)
+    var e = ModEngine.environment(library: lib, paths: paths)
+    e["FIFAMOD_RESOURCES"] = root; e["FIFAMOD_7ZZ"] = root + "/7zz"; e["FIFAMOD_UNRAR"] = root + "/unrar"
+    func run(_ args: String...) -> ModEngine.Result { ModEngine.run(executable: engine, args: args, environment: e) }
+    func state() -> LibraryState? { try? JSONDecoder.engine.decode(LibraryState.self, from: Data(run("state").output.utf8)) }
+    check(state()?.initialised == false, "engine: state before anything exists")
+    check(run("configure", "--game", "/games/x", "--build").ok, "engine: configure without a base patch")
+    check(state()?.initialised == true && state()?.hasBase == false, "engine: library without a base patch")
+    let src = scratch.appendingPathComponent("src/My Mod/data/ui/fonts")
+    try? fm.createDirectory(at: src, withIntermediateDirectories: true)
+    fm.createFile(atPath: src.appendingPathComponent("a.ttf").path, contents: Data("x".utf8))
+    let lines = LineBox()
+    let installed = ModEngine.run(executable: engine, args: ["install", src.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().path], environment: e) { lines.add($0) }
+    check(installed.ok, "engine: install a folder: \(installed.error)")
+    check(lines.all.contains { $0.hasPrefix("installed to") }, "engine: output arrives line by line")
+    check(fm.fileExists(atPath: store.appendingPathComponent("merged/data/ui/fonts/a.ttf").path), "engine: merged tree built")
+    let mods = state()?.mods ?? []
+    check(mods.count == 1 && mods[0].enabled && mods[0].files == 1, "engine: mod listed")
+    let again = run("install", src.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().path)
+    check(!again.ok && again.error.contains("already installed"), "engine: a duplicate fails with status and message: \(again.status) \(again.error)")
+    if let slug = mods.first?.slug {
+        check(run("disable", slug).ok && state()?.mods.first?.enabled == false, "engine: disable")
+        check(!fm.fileExists(atPath: store.appendingPathComponent("merged/data/ui/fonts/a.ttf").path), "engine: a disabled mod leaves the merged tree")
+        check(run("enable", slug).ok, "engine: enable")
+        let d = try? JSONDecoder.engine.decode(ModDetails.self, from: Data(run("details", slug).output.utf8))
+        check(d?.slug == slug && d?.parts.isEmpty == true, "engine: details decode; a one-folder mod has no parts to switch")
+        check(run("scoreboard", "53", slug).ok && state()?.scoreboards.first?.comp == 53, "engine: scoreboard")
+        check(run("scoreboard", "53", "--clear").ok && state()?.scoreboards.isEmpty == true, "engine: scoreboard cleared")
+        check(run("remove", slug, "--yes").ok && state()?.mods.isEmpty == true, "engine: remove")
+    }
+    // Multi-part archives: any part chosen, extracted from the first one, named without the part suffix.
+    let volSrc = scratch.appendingPathComponent("vol/data/ui/fonts")
+    try? fm.createDirectory(at: volSrc, withIntermediateDirectories: true)
+    fm.createFile(atPath: volSrc.appendingPathComponent("big.ttf").path, contents: Data((0..<3000).map { _ in UInt8.random(in: 0...255) }))  // incompressible: several volumes
+    let sevenZip = Process(); sevenZip.executableURL = URL(fileURLWithPath: root + "/7zz")
+    fm.createFile(atPath: scratch.appendingPathComponent("vol/readme.txt").path, contents: Data("hi".utf8))  // two top entries: the name comes from the archive
+    sevenZip.currentDirectoryURL = scratch.appendingPathComponent("vol")
+    sevenZip.arguments = ["a", "-v1k", "-bso0", scratch.appendingPathComponent("Multi Part.7z").path, "data", "readme.txt"]
+    try? sevenZip.run(); sevenZip.waitUntilExit()
+    check(fm.fileExists(atPath: scratch.appendingPathComponent("Multi Part.7z.002").path), "engine test: a multi-volume archive was made")
+    let fromPart3 = run("install", scratch.appendingPathComponent("Multi Part.7z.003").path)
+    check(fromPart3.ok && fromPart3.output.contains("extracting from Multi Part.7z.001"), "engine: a later part installs from the first: \(fromPart3.error)")
+    check(state()?.mods.first?.name == "Multi Part" && state()?.mods.first?.files == 1, "engine: multi-part mod named without the part suffix: \(state()?.mods.first?.name ?? "-")")
+    if let slug = state()?.mods.first?.slug { _ = run("remove", slug, "--yes") }
+    let orphan = scratch.appendingPathComponent("Alone.part2.rar"); fm.createFile(atPath: orphan.path, contents: Data())
+    let r2 = run("install", orphan.path)
+    check(!r2.ok && r2.error.contains("first part"), "engine: a later part without its first part is refused with a reason")
+    for refused in ["/Applications", "/Applications/Safari.app", NSHomeDirectory(), NSHomeDirectory() + "/Downloads", "/"] {
+        let r = run("install", refused)
+        check(!r.ok && !fm.fileExists(atPath: store.appendingPathComponent(".tmp").path + "/x"), "engine: \(refused) refused: \(r.message)")
+    }
+    // Cancel during an install: stops at once, nothing left behind.
+    let big = scratch.appendingPathComponent("big/data/ui")
+    try? fm.createDirectory(at: big, withIntermediateDirectories: true)
+    for i in 0..<40 { fm.createFile(atPath: big.appendingPathComponent("f\(i).bin").path, contents: Data(count: 32 << 20)) }
+    let handle = ModEngine.Handle()
+    DispatchQueue.global().asyncAfter(deadline: .now() + 0.25) { handle.cancel() }
+    let cancelled = ModEngine.run(executable: engine, args: ["install", scratch.appendingPathComponent("big").path], environment: e, handle: handle)
+    let left = ((try? fm.contentsOfDirectory(atPath: store.appendingPathComponent(".tmp").path)) ?? []).filter { $0.hasPrefix("fifamod-") }
+    check(!cancelled.ok && handle.wasCancelled && left.isEmpty, "engine: cancel stops the install and cleans up: \(cancelled.status) \(cancelled.error) \(left)")
+    check(state()?.mods.isEmpty == true, "engine: a cancelled install adds nothing")
+    let bad = run("configure", "--base", engine.deletingLastPathComponent().path)
+    check(!bad.ok && bad.message.contains("no data/ folder"), "engine: a wrong base patch folder is refused")
+}
+
 // MARK: Launch through the stub run.sh, then Stop
 do {
     var s = LauncherSettings()
+    let patchDir = scratch.appendingPathComponent("patch")
+    try? fm.createDirectory(at: patchDir.appendingPathComponent("data"), withIntermediateDirectories: true)
     s.gameDir = gameDir.path
-    s.modsDir = modsDir.path
+    s.modsDir = patchDir.path
     s.frameStats = true
     let env = s.launchEnvironment(base: ["PATH": "/usr/bin:/bin", "HOME": scratch.path], paths: paths)
     try? fm.createDirectory(at: dataDir, withIntermediateDirectories: true)
@@ -219,7 +370,7 @@ do {
             check(got[k] == v, "run.sh received \(k)=\(v) (got \(got[k] ?? "nil"))")
         }
         check(got["BB_FULLSCREEN"] == nil && got["BB_PRESENT_MODE"] == nil && got["MTL_HUD_ENABLED"] == nil, "defaults add no option variables")
-        check(got["FIFA_UPDATE_DIR"] == "" && got["FIFA_MODS_DIR"] == modsDir.path, "empty update, chosen mods")
+        check(got["FIFA_UPDATE_DIR"] == "" && got["FIFA_MODS_DIR"] == patchDir.path, "empty update, chosen patch folder")
     }
     if let pid = r.pid {
         // The stub's "emulator" is a sleep, not shadps4: Stop must refuse it (wrong name) ...

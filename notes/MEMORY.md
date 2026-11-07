@@ -5,3 +5,6 @@
 - [No lldb on x86 shadps4](feedback-no-lldb-rosetta.md) — wedged Rosetta oahd; use SHAD_FAULT_DIAG instead
 - [fifamod mod manager](fifamod-mod-manager.md) — ~/FIFA16Mods, one folder per mod on SSD, merged symlink overlay; never run fip_overlay.sh again; exFAT caveats
 - [pes2fifa stadium converter](pes2fifa-stadium-converter.md) — PES 2021 stadium folder -> FIFA 16 mod; Camp Nou = id 6; reflection not rotation; how to test in game
+- [FIFA 16 GitHub repos](fifa16-github-repos.md) — 4 private repos (mods, tools, shadps4-fifa, bloodborne fork); push quirks; never push game data
+- [FIFA 16 app on macOS 26](fifa16-app-macos26-host.md) — libmalloc blocks the low range; 26 libmalloc pointer range below 64 GiB kills pinned hosts; v0.4.5 SDK-12 stamp fixed it (confirmed on 26); v0.4.6 saves fix + isolation from other shadPS4 installs; test with --no-macos27 + harness
+- [FIFA 16 app Mods page](fifa16-app-mods-page.md) — v0.4.0 side menu, compiled engine, build steps; announce test runs on the user's screen first

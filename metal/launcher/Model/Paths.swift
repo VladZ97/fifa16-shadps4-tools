@@ -20,7 +20,9 @@ struct Paths: Equatable {
     static func live() -> Paths {
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support")
-        return Paths(dataDir: support.appendingPathComponent(appName), bundle: Bundle.main.bundleURL)
+        // FIFA16_DATA_DIR: a separate data folder (testing a build beside the installed app).
+        let override = ProcessInfo.processInfo.environment["FIFA16_DATA_DIR"].flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0) }
+        return Paths(dataDir: override ?? support.appendingPathComponent(appName), bundle: Bundle.main.bundleURL)
     }
 
     // MARK: bundle payload (make_app.sh fills these)
@@ -31,7 +33,11 @@ struct Paths: Equatable {
     var bbportIni: URL { resources.appendingPathComponent("bbport.ini") }
     var configTemplate: URL { resources.appendingPathComponent("config.template.json") }
     var emulator: URL { resources.appendingPathComponent("emulator/shadps4") }
-    var fifamod: URL { resources.appendingPathComponent("fifamod/fifamod.py") }
+    /// The mod manager: compiled engine, 7-Zip and the files it reads. Needs nothing installed.
+    var modResources: URL { resources.appendingPathComponent("fifamod") }
+    var modEngine: URL { modResources.appendingPathComponent("engine/fifamod") }
+    var sevenZip: URL { modResources.appendingPathComponent("7zz") }
+    var unrar: URL { modResources.appendingPathComponent("unrar") }
     /// The GPU host app (Game Mode, direct presentation). The emulator runs the -macos27 sibling
     /// on macOS 27, so that copy is the one that must exist.
     var hostBundle: URL { bundle.appendingPathComponent("Contents/Helpers/FIFA 16 GPU.app") }
@@ -47,6 +53,8 @@ struct Paths: Equatable {
     var config: URL { user.appendingPathComponent("config.json") }
     var shaderCache: URL { user.appendingPathComponent("cache/\(Self.titleID)") }
     var runs: URL { dataDir.appendingPathComponent("runs") }
+    /// The mod library of this app: registry, merged tree and, unless another folder is chosen, the mods.
+    var modStore: URL { dataDir.appendingPathComponent("mods") }
     /// Savegames when the user has not chosen a folder.
     var defaultSaves: URL { dataDir.appendingPathComponent("saves") }
 

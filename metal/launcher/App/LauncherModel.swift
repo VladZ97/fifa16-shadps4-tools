@@ -14,6 +14,7 @@ final class LauncherModel: ObservableObject {
             guard settings != oldValue else { return }
             try? settings.save(to: paths.settingsFile)
             refreshStatus()
+            if settings.modsDir != oldValue.modsDir { mods.reload() }
         }
     }
     @Published private(set) var status: [StatusItem] = []
@@ -25,8 +26,12 @@ final class LauncherModel: ObservableObject {
     @Published private(set) var scriptOutput = ""
     @Published var message: String?
     @Published var page = Page.game
+    /// The Advanced Settings section of the Game page is open.
+    @Published var advancedOpen = false
 
-    enum Page: Hashable { case game, log }
+    enum Page: Hashable { case game, mods, log }
+    /// The Mods page's state.
+    let mods = ModsModel()
 
     var onStateChange: (() -> Void)?
     private var timer: Timer?
@@ -42,8 +47,10 @@ final class LauncherModel: ObservableObject {
         } else {
             try? FileManager.default.removeItem(at: paths.stateFile)
         }
+        mods.attach(self)
         refreshStatus()
         refresh()
+        mods.reload()
         timer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
         }
@@ -112,8 +119,8 @@ final class LauncherModel: ObservableObject {
         if !foreign.isEmpty {
             let alert = NSAlert()
             alert.messageText = "Another shadPS4 is running"
-            alert.informativeText = "run.sh stops every running shadps4 before it starts the game. Running now: pid \(foreign.map { String($0.pid) }.joined(separator: ", "))."
-            alert.addButton(withTitle: "Stop It and Play")
+            alert.informativeText = "It is not part of this app and will be left running (pid \(foreign.map { String($0.pid) }.joined(separator: ", "))). Two emulators at once share the GPU and the keyboard, so the game may run poorly until it is closed."
+            alert.addButton(withTitle: "Play Anyway")
             alert.addButton(withTitle: "Cancel")
             alert.alertStyle = .warning
             guard alert.runModal() == .alertFirstButtonReturn else { return }
@@ -195,7 +202,7 @@ final class LauncherModel: ObservableObject {
             switch self {
             case .game: return "The dumped CUSA02138 folder: eboot.bin and sce_sys/ inside. Required."
             case .update: return "The dumped update 1.07 (CUSA02138-UPDATE). Optional: without it the 1.00 game runs."
-            case .mods: return "A patch or mods folder (what fifamod builds); the game sees it as /download0. Optional."
+            case .mods: return "Where your mods are kept: any folder, an external drive too. Optional: by default they stay in the app's data folder."
             case .saves: return "Where savegames are kept. Default: the app's data folder."
             }
         }
@@ -214,6 +221,13 @@ final class LauncherModel: ObservableObject {
     func folderIsSet(_ folder: Folder) -> Bool {
         folder == .saves || !folderPath(folder).trimmingCharacters(in: .whitespaces).isEmpty
     }
+
+    /// The bundled items and the data the app looks after itself (Advanced Settings).
+    var bundledStatus: [StatusItem] { status.filter(\.bundled) }
+    /// What the user chose.
+    var chosenStatus: [StatusItem] { status.filter { !$0.bundled } }
+    /// Advanced Settings opens by itself when something in it stops Play.
+    var bundledProblem: Bool { problems.contains(where: \.bundled) }
 
     func setFolder(_ folder: Folder, _ path: String) {
         switch folder {
@@ -253,7 +267,7 @@ final class LauncherModel: ObservableObject {
         try? FileManager.default.createDirectory(at: folders.saves, withIntermediateDirectories: true)
         NSWorkspace.shared.open(folders.saves)
     }
-    func openMods() { if let mods = folders.mods { NSWorkspace.shared.open(mods) } }
+    func openMods() { if let dir = mods.folderToOpen { NSWorkspace.shared.open(dir) } }
     func openShaderCache() {
         try? FileManager.default.createDirectory(at: paths.shaderCache, withIntermediateDirectories: true)
         NSWorkspace.shared.open(paths.shaderCache)
