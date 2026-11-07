@@ -40,10 +40,10 @@ cp ~/fifa_metal/launcher/art/FIFA16.icns "$APP/Contents/Resources/FIFA16.icns"; 
 rm -rf "$APP/Contents/Resources/Licenses"; cp -R ~/fifa_metal/app/licenses "$APP/Contents/Resources/Licenses"
 cp ~/fifa_metal/app/NOTICE "$APP/Contents/Resources/NOTICE"
 # SOURCES.txt: the exact commits this build was made from (GPL corresponding source)
-{ echo "F16.app $ver - corresponding source"; echo; echo "fifa16_mac_port (libbbgpu, bbgpu-host*, libbbhost)  https://github.com/VladZ97/fifa16_mac_port  $(git -C ~/fifa_metal/bloodborne_mac_port rev-parse HEAD)";
-  echo "shadps4-fifa (emulator)                           https://github.com/VladZ97/shadps4-fifa     $(git -C ~/fifa_metal/shadps4-metal rev-parse HEAD)";
-  echo "fifa16-shadps4-tools (launcher, run.sh, scripts)  https://github.com/VladZ97/fifa16-shadps4-tools  $(git -C ~/fifa16-shadps4-tools rev-parse HEAD)";
-  echo "fifa16-mods (fifamod engine)                      https://github.com/VladZ97/fifa16-mods      $(git -C ~/FIFA16Mods rev-parse HEAD)";
+{ echo "F16.app $ver - corresponding source"; echo; echo "fifa16_mac_port (libbbgpu, bbgpu-host*, libbbhost)  https://github.com/VladZ97/fifa16_mac_port  $(git -C ~/fifa_metal/bloodborne_mac_port rev-parse "$ver^{commit}" 2>/dev/null || git -C ~/fifa_metal/bloodborne_mac_port rev-parse HEAD)";
+  echo "shadps4-fifa (emulator)                           https://github.com/VladZ97/shadps4-fifa     $(git -C ~/fifa_metal/shadps4-metal rev-parse "$ver^{commit}" 2>/dev/null || git -C ~/fifa_metal/shadps4-metal rev-parse HEAD)";
+  echo "fifa16-shadps4-tools (launcher, run.sh, scripts)  https://github.com/VladZ97/fifa16-shadps4-tools  $(git -C ~/fifa16-shadps4-tools rev-parse "$ver^{commit}" 2>/dev/null || git -C ~/fifa16-shadps4-tools rev-parse HEAD)";
+  echo "fifa16-mods (fifamod engine)                      https://github.com/VladZ97/fifa16-mods      $(git -C ~/FIFA16Mods rev-parse "$ver^{commit}" 2>/dev/null || git -C ~/FIFA16Mods rev-parse HEAD)";
   echo; echo "Each repository carries the tag $ver at the commit above. Third-party versions: see Licenses/README.md."; } > "$APP/Contents/Resources/SOURCES.txt"
 rm -rf "$APP/Contents/Helpers/F16 GPU.app/Contents/_CodeSignature"
 xattr -cr "$APP" 2>/dev/null || true
