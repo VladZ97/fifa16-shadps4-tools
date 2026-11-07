@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 // Model tests for the FIFA 16 launcher (bash build.sh --test). One PASS line or exit 1.
 //
 // Everything runs against a throw-away data folder and a fake bundle created here, never the
@@ -72,7 +73,7 @@ do {
     check(paths.config.path == dataDir.path + "/user/config.json", "config under the data folder's user dir")
     check(paths.shaderCache.path.hasSuffix("/user/cache/CUSA02138"), "shader cache path")
     check(paths.defaultSaves.path == dataDir.path + "/saves", "default saves folder")
-    check(paths.hostBundle.path == bundle.path + "/Contents/Helpers/FIFA 16 GPU.app", "host bundle inside the app")
+    check(paths.hostBundle.path == bundle.path + "/Contents/Helpers/F16 GPU.app", "host bundle inside the app")
     check(paths.latestRun() == nil, "no runs yet")
     write("", paths.runs.appendingPathComponent("20260101_000000/emulator.log"))
     write("", paths.runs.appendingPathComponent("20260102_000000/emulator.log"))

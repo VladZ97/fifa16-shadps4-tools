@@ -34,8 +34,8 @@ explodes into stadium-sized brown streaks in replays/close-ups. Convert with
 ## Database
 
 `data/db/fifa_ng_db.db` with `fifa_ng_db-meta.xml`; signature `DB\0\x08` then platform
-byte (0 = PC layout, which the PS4 build also uses), tables with bit-packed fields. The
-decompiled FifaLibrary (`DbFile.cs`, `Table.cs`, `Record.cs`) documents the layout if a
+byte (0 = PC layout, which the PS4 build also uses), tables with bit-packed fields. The layout
+is the community-documented t3db format; `tools/fifadb.py` in fifa16-mods reads it if a
 database edit is ever needed; for head problems the Lua override is simpler.
 
 ## DDS UI images

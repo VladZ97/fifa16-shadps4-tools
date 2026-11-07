@@ -1,6 +1,7 @@
-// Original app icon for the FIFA 16 launcher, in the spirit of the game's tile: teal gradient,
-// a ring badge on top, "F 16" in heavy italics below. Drawn here from scratch: no game artwork,
-// no logos, no trademarked word marks.
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Original app icon for the F16 launcher: teal gradient, a ring badge with a football on top,
+// "F 16" in heavy italics below. Drawn here from scratch: no game artwork, no logos, no
+// trademarked word marks.
 //   swift draw_icon.swift <out.png> [size]      (default 1024)
 import AppKit
 

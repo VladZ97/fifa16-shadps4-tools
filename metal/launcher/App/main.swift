@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 // FIFA 16.app's main executable: the launcher window, or with --cli a command line over the
 // same model code (status | env | play | stop | set), for scripts and the smoke test.
 import AppKit
@@ -119,7 +120,7 @@ func cli(_ args: [String]) -> Int32 {
         print("stop pid \(state.pid): \(r)")
         return 0
     default:
-        print("usage: FIFA\\ 16 --cli [status|env|play [--force]|stop|set <key> <value>]")
+        print("usage: F16 --cli [status|env|play [--force]|stop|set <key> <value>]")
         return 2
     }
 }

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 // FIFA 16 launcher: the mod library. The bundled engine (compiled fifamod) does the work; this
 // file says where the library is, reads what the engine reports and runs it. No UI here, so the
 // model tests cover it.

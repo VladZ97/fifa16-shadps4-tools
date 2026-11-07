@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Builds the launcher executable and the bare F16.app skeleton here (~/fifa_metal/launcher),
 # the same way the Bloodborne port builds its launcher: plain swiftc over Model/ and App/, an
-# ad-hoc signed bundle, the icon and header art made from the game's own sce_sys artwork.
+# ad-hoc signed bundle, the app's own icon (art/icon.png).
 # The payload (emulator, GPU host app, run.sh, settings, fifamod) is added afterwards by
 # make_app.sh, which also signs the finished bundle.
 #

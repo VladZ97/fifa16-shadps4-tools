@@ -1,0 +1,33 @@
+F16 (unofficial launcher for the PS4 version of FIFA 16 on Apple Silicon) - third-party notices
+
+This app bundles the following software. Full licence texts: Licenses/. Exact sources of this
+build: SOURCES.txt. Unofficial project; not affiliated with Electronic Arts, FIFA, Sony or Konami.
+
+shadPS4                 Copyright (c) shadPS4 Emulator Project                  GPL-2.0-or-later
+bloodborne_mac_port     Copyright (c) 2026 Mark Hall and contributors            GPL-2.0-or-later
+F16 launcher, fifamod   Copyright (c) 2026 VladZ97                               GPL-2.0-or-later
+FFmpeg (n7.1.5, no GPL parts) Copyright (c) the FFmpeg developers               LGPL-2.1-or-later
+SDL3                    Copyright (c) 1997-2026 Sam Lantinga                     zlib
+Vulkan Loader           Copyright (c) 2014-2026 The Khronos Group Inc., Valve, LunarG   Apache-2.0
+SPIRV-Cross             Copyright (c) 2015-2026 Arm Limited and contributors    Apache-2.0
+KosmicKrisp / Mesa      Copyright (c) Mesa contributors; KosmicKrisp by LunarG  MIT
+7-Zip 23.01             Copyright (c) 1999-2023 Igor Pavlov                     LGPL-2.1 + unRAR restriction; LZFSE (c) Apple Inc., BSD-3
+UnRAR 6.12              Copyright (c) 1993-2022 Alexander Roshal                UnRAR licence (free distribution; not for re-creating RAR compression)
+Python 3.10.11          Copyright (c) 2001-2023 Python Software Foundation      PSF-2.0
+PyInstaller bootloader (6.22.3) Copyright (c) 2005-2026 PyInstaller Development Team  GPL-2.0-or-later WITH Bootloader-exception
+fmt                     Copyright (c) 2012-present Victor Zverovich             MIT
+xxHash                  Copyright (c) 2012-2021 Yann Collet                     BSD-2-Clause
+miniz                   Copyright (c) 2013-2014 RAD Game Tools and Valve; 2010-2014 Rich Geldreich   MIT
+robin-map               Copyright (c) 2017 Thibaut Goetghebuer-Planchon         MIT
+magic_enum              Copyright (c) 2019-2024 Daniil Goncharov                MIT
+sirit                   Copyright (c) 2019 sirit contributors                   BSD-3-Clause
+Dear ImGui              Copyright (c) 2014-2026 Omar Cornut                     MIT
+half                    Copyright (c) 2012-2021 Christian Rau                   MIT
+FSR Vulkan port         Copyright (c) Q2RTX FSR Vulkan contributors             MIT
+AMD GCN register headers Copyright (c) 2014-2021 Advanced Micro Devices, Inc.   MIT
+LibAtrac9               Copyright (c) 2018 Alex Barney                          MIT
+DejaVu Sans             Copyright (c) 2003 Bitstream, Inc.; DejaVu changes public domain   Bitstream Vera licence
+
+The notices of the statically linked libraries (fmt, xxHash, miniz, robin-map, magic_enum, sirit,
+Dear ImGui, half, FSR, AMD headers, LibAtrac9, DejaVu) are reproduced from the licence files in the
+fifa16_mac_port tree (gpu/third_party, deps/src); years and holders as stated there.

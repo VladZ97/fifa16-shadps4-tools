@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 // FIFA 16 launcher: the window's state. Play runs the bundled run.sh (GameControl.launch) with
 // the four folders the user chose; Stop stops only the emulator this launcher started
 // (state.json); everything else is read-only.
@@ -69,7 +70,7 @@ final class LauncherModel: ObservableObject {
     var runFolder: URL? { game.map { URL(fileURLWithPath: $0.runDir) } ?? paths.latestRun() }
     var commandLine: String {
         let env = settings.overrides.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value) " }.joined()
-        return env + "bash \"FIFA 16.app/Contents/Resources/run.sh\" " + settings.mode.rawValue
+        return env + "bash \"F16.app/Contents/Resources/run.sh\" " + settings.mode.rawValue
     }
 
     func refreshStatus() {

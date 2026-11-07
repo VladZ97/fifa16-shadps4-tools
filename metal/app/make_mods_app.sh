@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # The app with the Mods page: the last released bundle (out26) with only these replaced: the
 # launcher executable, run.sh and Resources/fifamod (compiled engine, 7zz, stock lists). The
 # emulator, GPU hosts and libraries stay byte for byte as released.

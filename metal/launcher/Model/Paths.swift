@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 // FIFA 16 launcher: every location the launcher uses, derived from two roots: the app bundle
 // (read-only payload: emulator, GPU host, run.sh, renderer settings) and the data folder
 // (~/Library/Application Support/FIFA 16: settings, state, the emulator's user folder, runs).
@@ -8,6 +9,8 @@ struct Paths: Equatable {
     /// Data folder name (~/Library/Application Support/FIFA 16): kept across the rename to F16.app so
     /// existing settings, caches and saves stay where they are.
     static let appName = "FIFA 16"
+    /// What the app calls itself on screen.
+    static let displayName = "F16"
     static let titleID = "CUSA02138"
 
     let dataDir: URL
@@ -42,7 +45,7 @@ struct Paths: Equatable {
     var unrar: URL { modResources.appendingPathComponent("unrar") }
     /// The GPU host app (Game Mode, direct presentation). The emulator runs the -macos27 sibling
     /// on macOS 27, so that copy is the one that must exist.
-    var hostBundle: URL { bundle.appendingPathComponent("Contents/Helpers/FIFA 16 GPU.app") }
+    var hostBundle: URL { bundle.appendingPathComponent("Contents/Helpers/F16 GPU.app") }
     var gpuHost: URL { hostBundle.appendingPathComponent("Contents/MacOS/bbgpu-host") }
     var gpuHostMacOS27: URL { URL(fileURLWithPath: gpuHost.path + "-macos27") }
 

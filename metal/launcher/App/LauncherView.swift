@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 // FIFA 16 launcher window: game art header, a side menu (Game, Mods, Log), the four folders and
 // the checklist with the app's own parts folded under Advanced Settings, the options, and the
 // Play/Stop bar.
@@ -224,7 +225,7 @@ private struct Header: View {
             LinearGradient(colors: [.clear, .black.opacity(0.75)], startPoint: .top, endPoint: .bottom)
             HStack(alignment: .bottom) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("FIFA 16").font(.system(size: 30, weight: .bold)).foregroundStyle(.white)
+                    Text(Paths.displayName).font(.system(size: 30, weight: .bold)).foregroundStyle(.white)
                     Text("PS4 CUSA02138 · shadPS4 with the native Metal renderer")
                         .font(.callout).foregroundStyle(.white.opacity(0.8))
                 }

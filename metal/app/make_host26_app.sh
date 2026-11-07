@@ -1,13 +1,18 @@
 #!/bin/bash
-# fifa-hybrid: FIFA 16.app with the macOS 26 GPU host path: the plain bbgpu-host (rebuilt: takeover +
+# SPDX-License-Identifier: GPL-2.0-or-later
+# fifa-hybrid: F16.app with the macOS 26 GPU host path: the plain bbgpu-host (rebuilt: takeover +
 # re-exec), bbgpu-host-macos26 (stub with the pinned ranges) and libbbhost.dylib added to the GPU host
 # app. Emulator, bbgpu-host-macos27 and libbbgpu.dylib are the files of the base app, untouched.
 #   bash make_host26_app.sh <version> [base app] [--no-macos27]   -> ~/fifa_metal/app/out_host26/
 # --no-macos27 drops bbgpu-host-macos27 so the plain host (and its re-exec) runs on this Mac (testing).
 set -euo pipefail
-ver=${1:?version}; BASE=${2:-$HOME/fifa_metal/app/out_mods/FIFA 16.app}; NO27=${3:-}
+ver=${1:?version}; BASE=${2:-$HOME/fifa_metal/app/out_host26/F16.app}; NO27=${3:-}
 B=~/fifa_metal/fifa16_mac_port; OUT=~/fifa_metal/app/out_host26; rm -rf "$OUT"; mkdir -p "$OUT"
-cp -R "$BASE" "$OUT/F16.app"; APP="$OUT/F16.app"; HM="$APP/Contents/Helpers/FIFA 16 GPU.app/Contents/MacOS"
+cp -R "$BASE" "$OUT/F16.app"; APP="$OUT/F16.app"
+# The GPU helper is "F16 GPU.app"; a base built before the rename is converted here.
+if [ -d "$APP/Contents/Helpers/FIFA 16 GPU.app" ]; then mv "$APP/Contents/Helpers/FIFA 16 GPU.app" "$APP/Contents/Helpers/F16 GPU.app"; fi
+cp "$HOME/fifa_metal/host_app/F16 GPU.app/Contents/Info.plist" "$APP/Contents/Helpers/F16 GPU.app/Contents/Info.plist"
+HM="$APP/Contents/Helpers/F16 GPU.app/Contents/MacOS"
 cp "$B/out/bbgpu-host" "$B/out/bbgpu-host-macos26" "$B/out/gpu-arm64/libbbhost.dylib" "$HM/"
 cp "$HOME/fifa_metal/app/run.sh" "$APP/Contents/Resources/run.sh"; chmod +x "$APP/Contents/Resources/run.sh"   # in-process fallback
 for f in "$HM/bbgpu-host" "$HM/bbgpu-host-macos26" "$HM/libbbhost.dylib"; do
@@ -33,7 +38,14 @@ fi
 # game's header art from the user's game folder at runtime); third-party licence texts.
 cp ~/fifa_metal/launcher/art/FIFA16.icns "$APP/Contents/Resources/FIFA16.icns"; rm -f "$APP/Contents/Resources/banner.jpg"
 rm -rf "$APP/Contents/Resources/Licenses"; cp -R ~/fifa_metal/app/licenses "$APP/Contents/Resources/Licenses"
-rm -rf "$APP/Contents/Helpers/FIFA 16 GPU.app/Contents/_CodeSignature"
+cp ~/fifa_metal/app/NOTICE "$APP/Contents/Resources/NOTICE"
+# SOURCES.txt: the exact commits this build was made from (GPL corresponding source)
+{ echo "F16.app $ver - corresponding source"; echo; echo "fifa16_mac_port (libbbgpu, bbgpu-host*, libbbhost)  https://github.com/VladZ97/fifa16_mac_port  $(git -C ~/fifa_metal/bloodborne_mac_port rev-parse HEAD)";
+  echo "shadps4-fifa (emulator)                           https://github.com/VladZ97/shadps4-fifa     $(git -C ~/fifa_metal/shadps4-metal rev-parse HEAD)";
+  echo "fifa16-shadps4-tools (launcher, run.sh, scripts)  https://github.com/VladZ97/fifa16-shadps4-tools  $(git -C ~/fifa16-shadps4-tools rev-parse HEAD)";
+  echo "fifa16-mods (fifamod engine)                      https://github.com/VladZ97/fifa16-mods      $(git -C ~/FIFA16Mods rev-parse HEAD)";
+  echo; echo "Each repository carries the tag $ver at the commit above. Third-party versions: see Licenses/README.md."; } > "$APP/Contents/Resources/SOURCES.txt"
+rm -rf "$APP/Contents/Helpers/F16 GPU.app/Contents/_CodeSignature"
 xattr -cr "$APP" 2>/dev/null || true
 find "$APP" -name "._*" -delete   # AppleDouble files a base copied from exFAT brings along (they break signing)
 codesign --force --deep -s - "$APP"; codesign --verify --deep --strict "$APP" && echo "signature ok"
@@ -42,6 +54,6 @@ for f in "$HM/bbgpu-host" "$HM/bbgpu-host-macos26" "$HM/libbbhost.dylib"; do
 done
 # The stub must take libbbhost and libbbgpu from the bundle (SDL/ffmpeg: the bundled libbbgpu.dylib
 # still carries this Mac's deps rpath, so here they come from there, as in the shipped app).
-DYLD_PRINT_LIBRARIES=1 "$HM/bbgpu-host-macos26" 2>&1 | grep -E "dyld\[.*\]: <" | sed 's/.*> //' | grep "libbb" | grep -v "FIFA 16 GPU.app" && { echo "libbb* outside the bundle"; exit 1; }
+DYLD_PRINT_LIBRARIES=1 "$HM/bbgpu-host-macos26" 2>&1 | grep -E "dyld\[.*\]: <" | sed 's/.*> //' | grep "libbb" | grep -v "F16 GPU.app" && { echo "libbb* outside the bundle"; exit 1; }
 "$HM/bbgpu-host-macos26" 2>&1 | head -2 || true
 (cd "$OUT" && rm -f "F16-macOS-$ver.zip" && ditto -c -k --norsrc --keepParent "F16.app" "F16-macOS-$ver.zip" && du -sh "F16-macOS-$ver.zip" | cut -f1)

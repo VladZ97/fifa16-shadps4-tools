@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 // FIFA 16 launcher: settings.json (the four folders and the few options) and the environment
 // Play hands the bundled run.sh. run.sh owns every emulator and bridge variable; the launcher
 // passes the folders, and an option only when it differs from run.sh's default.

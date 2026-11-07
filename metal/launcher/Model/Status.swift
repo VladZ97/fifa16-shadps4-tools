@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 // FIFA 16 launcher: the installation checklist (read-only) and the log tail.
 import Foundation
 

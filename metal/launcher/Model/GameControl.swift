@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 // FIFA 16 launcher: starting the bundled run.sh, finding the game's processes and stopping them.
 // Process work without UI, shared by the window and the command line (`FIFA 16 --cli ...`).
 import Foundation

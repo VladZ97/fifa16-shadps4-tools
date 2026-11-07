@@ -1,5 +1,6 @@
 #!/bin/bash
-# FIFA 16.app - launch logic. Lives in the bundle (Contents/Resources/run.sh); every location comes
+# SPDX-License-Identifier: GPL-2.0-or-later
+# F16.app - launch logic. Lives in the bundle (Contents/Resources/run.sh); every location comes
 # from the environment the launcher sets, nothing is hard-wired to a home folder:
 #   FIFA_APP        the .app bundle            FIFA_DATA_DIR   ~/Library/Application Support/FIFA 16
 #   FIFA_GAME_DIR   folder with eboot.bin      FIFA_UPDATE_DIR update 1.07 folder (optional)
@@ -15,7 +16,7 @@ set -u
 APP="${FIFA_APP:-$(cd "$(dirname "$0")/../.." && pwd)}"
 RES="$APP/Contents/Resources"
 EMU="$RES/emulator/shadps4"
-HOST="$APP/Contents/Helpers/FIFA 16 GPU.app/Contents/MacOS/bbgpu-host"
+HOST="$APP/Contents/Helpers/F16 GPU.app/Contents/MacOS/bbgpu-host"
 DATA="${FIFA_DATA_DIR:-$HOME/Library/Application Support/FIFA 16}"
 USERDIR="$DATA/user"; RUNS="$DATA/runs"
 GAME_DIR="${FIFA_GAME_DIR:-}"; UPDATE_DIR="${FIFA_UPDATE_DIR:-}"; MODS_DIR="${FIFA_MODS_DIR:-}"; SAVES_DIR="${FIFA_SAVES_DIR:-$DATA/saves}"

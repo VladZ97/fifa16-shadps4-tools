@@ -16,13 +16,22 @@ after updates, which overwrite the scripts.
 real face (`head_<id>_0.rx3`), 1 means generic. `playerFace` is an override table that other
 scripts (`rm_common.lua`) reset, so put the override inside the function:
 
-Add, inside `getPlayerFace` before its existing lookups, a table of ids that must use a generic
-head and return 1 for them (the two lines below are the whole addition; the rest of the
-function stays as the patch ships it):
-
 ```lua
+-- PS4/shadPS4 local fix: flagged for real faces in the database, no head files in any pack.
 ps4ForcedGenericFace = { [268889]=1, [272600]=1 }   -- ids from fip_missing.py
-if (ps4ForcedGenericFace[id] ~= nil) then return 1 end
+
+function getPlayerFace(id,headtype)
+
+if (ps4ForcedGenericFace[id] ~= nil) then
+return 1
+end
+
+if (playerFace[id] ~= nil) then
+return playerFace[id]
+end
+
+return headtype
+end
 ```
 
 Prefer installing the matching face pack; use the override for the remainder.
@@ -59,8 +68,8 @@ PS4 build crashes on them so they were removed, and `player.lua`'s `haircloth` c
 then falls back to a *generic* hairstyle's physics mesh (`simhair_<generichair>_<class>_0`),
 which drives the custom hair mesh with the wrong topology. Fix (fifamod mod "Hair physics
 fix (PS4)", 2026-11-04): in `PlayerAsset...` replace the second candidate with the
-non-existent `data/sceneassets/simplecloth/dummy_-1.rx3` (the game's own "no cloth"
-convention): in the `haircloth` AddAsset call, keep the first candidate (the player's own
-`simhair_<hair>_<class>_0.rx3`) and replace the second, generic one with the dummy path.
+non-existent `data/sceneassets/simplecloth/dummy_-1.rx3` (EA's own "no cloth" convention):
+
+    gr:AddAsset(player, lod, "haircloth", "data/sceneassets/simplecloth/simhair_${db.player[?].hair}_${db.player[?].faceProxyHeadClass}_0.rx3;data/sceneassets/simplecloth/dummy_-1.rx3")
 
 Stock players keep physics (their own simhair exists). Verify with a close-up replay.

@@ -1,5 +1,6 @@
 #!/bin/bash
-# Assembles the self-contained FIFA 16.app: the launcher (launcher/build.sh), the emulator and its
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Assembles the self-contained F16.app: the launcher (launcher/build.sh), the emulator and its
 # libraries, the GPU library and host, run.sh, settings, fifamod. Fixes the library search paths
 # so nothing points outside the bundle, signs it ad hoc and zips it.
 #   bash make_app.sh <version>      -> ~/fifa_metal/app/out/F16.app and F16-macOS-<version>.zip
@@ -25,7 +26,7 @@ install_name_tool -change @rpath/libz.1.dylib /usr/lib/libz.1.dylib "$EMU/libvul
 chmod +x "$EMU/shadps4"
 
 echo "== GPU host app (arm64) + libraries"
-cp -R "$HOME/fifa_metal/host_app/FIFA 16 GPU.app" "$HLP/"; HM="$HLP/FIFA 16 GPU.app/Contents/MacOS"
+cp -R "$HOME/fifa_metal/host_app/F16 GPU.app" "$HLP/"; HM="$HLP/F16 GPU.app/Contents/MacOS"
 # Three hosts: plain (macOS < 27; re-execs into -macos26 when its reservation fails), -macos26 (stub
 # with the pinned ranges + libbbhost.dylib), -macos27 (pinned ranges, code in the executable).
 cp "$B/out/bbgpu-host" "$B/out/bbgpu-host-macos27" "$B/out/bbgpu-host-macos26" "$HM/"; cp "$B/out/gpu-arm64/libbbgpu.dylib" "$B/out/gpu-arm64/libbbhost.dylib" "$HM/"; for l in "${LIBS[@]}"; do cp "$B/deps/arm64/lib/$l" "$HM/"; done
@@ -37,7 +38,7 @@ for h in "$HM/bbgpu-host" "$HM/bbgpu-host-macos27" "$HM/bbgpu-host-macos26" "$HM
     otool -l "$h" | grep -q '@executable_path' || install_name_tool -add_rpath @executable_path "$h"
     chmod +x "$h"
 done
-rm -rf "$HLP/FIFA 16 GPU.app/Contents/_CodeSignature"
+rm -rf "$HLP/F16 GPU.app/Contents/_CodeSignature"
 
 echo "== run logic, settings, mod manager"
 cp "$HERE/run.sh" "$RES/run.sh"; chmod +x "$RES/run.sh"; cp ~/fifa_metal/bbport.ini "$RES/bbport.ini"

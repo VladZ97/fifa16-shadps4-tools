@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 // FIFA 16 launcher: the Mods page's state. Every action runs the bundled engine off the main
 // thread, one at a time, and reloads the library afterwards. Changes are refused while a game
 // runs: the merged tree the game reads is replaced by every rebuild.

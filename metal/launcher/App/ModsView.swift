@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 // FIFA 16 launcher: the Mods page. Everything fifamod does on the command line, with nothing to
 // install: the library with a switch per mod, the switch for all of them, installing by button
 // or drag and drop, a sheet per mod (parts, variants, conflicts) and per-competition scoreboards.

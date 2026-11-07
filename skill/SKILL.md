@@ -82,8 +82,9 @@ ini files into `<game>-mods/`.
 - `theme <name>`: copy `fip/theme/<name>/` over the root (skipping preview.png).
 - `facepack <archive>`: extract face packs (their top folder is stripped).
 
-It keeps every overwritten file under `fip/_overwritten_by_mac_apply/`. The decompiled
-manager confirmed these are plain file copies; nothing is generated.
+It keeps every overwritten file under `fip/_overwritten_by_mac_apply/`. The manager's install
+steps are plain file copies (verified by comparing the patch folder before and after an install);
+nothing is generated.
 
 ### 4. Run, then analyse what the patch asked for and could not get
 

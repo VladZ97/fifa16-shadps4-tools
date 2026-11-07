@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Compiles the mod manager for the app bundle: fifamod.py + tools -> work_mods/pkg/fifamod (a
 # binary with no outside dependencies, 7zz, stock lists). Uses python.org's Python: every file it
 # ships targets macOS 11. pyenv or Homebrew Python pull in Homebrew libraries built for the
@@ -9,7 +10,7 @@ A=~/fifa_metal/app; W=$A/work_mods; E=$A/engine; cd "$W"
 rm -rf eng_build pkg; mkdir -p eng_build pkg/fifamod/stock/data/ui/fonts
 ./pyi/bin/pyinstaller --noconfirm --onedir --name fifamod --distpath eng_build/dist --workpath eng_build/work --specpath eng_build \
     --paths "$E/tools" --hidden-import hair_ps4 --hidden-import dds_ps4 --hidden-import fifadb \
-    --exclude-module tkinter --exclude-module unittest --exclude-module pydoc --exclude-module ssl --exclude-module lzma --exclude-module bz2 \
+    --exclude-module tkinter --exclude-module unittest --exclude-module pydoc --exclude-module ssl --exclude-module _ssl --exclude-module hashlib --exclude-module _hashlib --exclude-module lzma --exclude-module bz2 \
     --optimize 1 "$E/fifamod.py" 2>&1 | tail -1
 cp -RL eng_build/dist/fifamod pkg/fifamod/engine; rm -rf pkg/fifamod/engine/_internal/Python.framework
 install -m755 "$(python3 -c 'import os;print(os.path.realpath("/opt/homebrew/bin/7zz"))')" pkg/fifamod/7zz
