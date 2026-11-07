@@ -8,7 +8,7 @@
 #   bash build.sh          # build FIFA 16.app (skeleton)
 #   bash build.sh --test   # also build and run the model tests (Tests/main.swift)
 #
-# Artwork: GAME_ART_DIR=<folder with icon0.png and pic1.png> (a game's sce_sys folder);
+# Icon: art/icon.png (drawn by art/draw_icon.swift); no game artwork in the bundle.
 # without it the app has no icon, which is not an error.
 set -euo pipefail
 cd -- "$(dirname -- "$0")"
@@ -51,32 +51,22 @@ cat > "$app/Contents/Info.plist" <<PLIST
 PLIST
 install -m755 "$out/FIFA16Launcher" "$app/Contents/MacOS/FIFA 16"
 
-# Game artwork (read-only): GAME_ART_DIR, else the game folder from the launcher's own
-# settings.json if there is one. Missing art only means no icon.
-sce=${GAME_ART_DIR:-}
-if [[ -z $sce ]]; then
-    settings="$HOME/Library/Application Support/FIFA 16/settings.json"
-    if [[ -f $settings ]]; then
-        game=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("gameDir",""))' "$settings" 2>/dev/null || true)
-        [[ -n $game ]] && sce=$game/sce_sys
-    fi
-fi
-if [[ -n $sce && -f $sce/icon0.png ]]; then
+# Icon: the app's own drawing (art/draw_icon.swift -> art/icon.png, checked in). No game artwork is
+# used anywhere in the bundle; the launcher shows the game's own header art at runtime, read from
+# the game folder the user chose.
+if [[ -f art/icon.png ]]; then
     tmp=$(mktemp -d)
     set_dir=$tmp/FIFA16.iconset
     mkdir -p "$set_dir"
     for size in 16 32 128 256 512; do
-        sips -z $size $size "$sce/icon0.png" --out "$set_dir/icon_${size}x${size}.png" >/dev/null
+        sips -z $size $size art/icon.png --out "$set_dir/icon_${size}x${size}.png" >/dev/null
         double=$((size * 2))
-        sips -z $double $double "$sce/icon0.png" --out "$set_dir/icon_${size}x${size}@2x.png" >/dev/null
+        sips -z $double $double art/icon.png --out "$set_dir/icon_${size}x${size}@2x.png" >/dev/null
     done
     iconutil -c icns "$set_dir" -o "$app/Contents/Resources/FIFA16.icns"
     rm -rf "$tmp"
 else
-    echo "No game artwork (set GAME_ART_DIR=<sce_sys folder>): the app has no icon."
-fi
-if [[ -n $sce && -f $sce/pic1.png ]]; then
-    sips -s format jpeg -s formatOptions 80 --resampleWidth 1800 "$sce/pic1.png" --out "$app/Contents/Resources/banner.jpg" >/dev/null
+    echo "art/icon.png missing (swift art/draw_icon.swift art/icon.png): the app has no icon."
 fi
 codesign --force --sign - "$app" >/dev/null 2>&1 || codesign --force --sign - "$app/Contents/MacOS/FIFA 16"
 touch "$app"

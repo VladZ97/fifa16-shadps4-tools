@@ -82,13 +82,13 @@ FIFA 16.app/Contents/Helpers/FIFA 16 GPU.app             the GPU host app (bbgpu
 ```
 bash build.sh          # out/FIFA16Launcher and the bare FIFA 16.app (Info.plist, icon, launcher)
 bash build.sh --test   # builds and runs Tests/main.swift first (PASS: n checks, or exit 1)
-GAME_ART_DIR=<game>/sce_sys bash build.sh   # icon and header art from the game's artwork
+swift art/draw_icon.swift art/icon.png     # redraw the icon (checked in as art/icon.png)
 ```
 
 Requirements: Xcode command line tools (`swiftc`, `sips`, `iconutil`, `codesign`). build.sh
 produces only the skeleton; `make_app.sh` (in the tools repo) adds the payload, the GPU host app
-and signs the finished bundle. Without `GAME_ART_DIR` the app has no icon; build.sh also looks at
-the game folder in the launcher's own settings.json when there is one.
+and signs the finished bundle. The icon is the app's own drawing (`art/icon.png`); no game artwork
+is bundled, the launcher reads the game's header art from the chosen game folder at runtime.
 
 ## Tests
 

@@ -7,7 +7,7 @@
 set -euo pipefail
 ver=${1:?version}; BASE=${2:-$HOME/fifa_metal/app/out_mods/FIFA 16.app}; NO27=${3:-}
 B=~/fifa_metal/fifa16_mac_port; OUT=~/fifa_metal/app/out_host26; rm -rf "$OUT"; mkdir -p "$OUT"
-cp -R "$BASE" "$OUT/"; APP="$OUT/FIFA 16.app"; HM="$APP/Contents/Helpers/FIFA 16 GPU.app/Contents/MacOS"
+cp -R "$BASE" "$OUT/FIFA 16.app"; APP="$OUT/FIFA 16.app"; HM="$APP/Contents/Helpers/FIFA 16 GPU.app/Contents/MacOS"
 cp "$B/out/bbgpu-host" "$B/out/bbgpu-host-macos26" "$B/out/gpu-arm64/libbbhost.dylib" "$HM/"
 cp "$HOME/fifa_metal/app/run.sh" "$APP/Contents/Resources/run.sh"; chmod +x "$APP/Contents/Resources/run.sh"   # in-process fallback
 for f in "$HM/bbgpu-host" "$HM/bbgpu-host-macos26" "$HM/libbbhost.dylib"; do
@@ -29,8 +29,13 @@ if [ "${WITH_EMULATOR:-}" = 1 ]; then   # the rebuilt emulator (shadps4-metal/bu
     otool -l "$EMU/shadps4" | grep -q '@executable_path' || install_name_tool -add_rpath @executable_path "$EMU/shadps4"
     chmod +x "$EMU/shadps4"; echo "emulator replaced from shadps4-metal/build"
 fi
+# No game artwork in the bundle: the app's own icon (launcher/art), no banner (the launcher shows the
+# game's header art from the user's game folder at runtime); third-party licence texts.
+cp ~/fifa_metal/launcher/art/FIFA16.icns "$APP/Contents/Resources/FIFA16.icns"; rm -f "$APP/Contents/Resources/banner.jpg"
+rm -rf "$APP/Contents/Resources/Licenses"; cp -R ~/fifa_metal/app/licenses "$APP/Contents/Resources/Licenses"
 rm -rf "$APP/Contents/Helpers/FIFA 16 GPU.app/Contents/_CodeSignature"
 xattr -cr "$APP" 2>/dev/null || true
+find "$APP" -name "._*" -delete   # AppleDouble files a base copied from exFAT brings along (they break signing)
 codesign --force --deep -s - "$APP"; codesign --verify --deep --strict "$APP" && echo "signature ok"
 for f in "$HM/bbgpu-host" "$HM/bbgpu-host-macos26" "$HM/libbbhost.dylib"; do
     otool -l "$f" | awk '/LC_RPATH/{getline; getline; print $2}' | grep -v '^@' && { echo "outside rpath in $f"; exit 1; }
@@ -39,4 +44,4 @@ done
 # still carries this Mac's deps rpath, so here they come from there, as in the shipped app).
 DYLD_PRINT_LIBRARIES=1 "$HM/bbgpu-host-macos26" 2>&1 | grep -E "dyld\[.*\]: <" | sed 's/.*> //' | grep "libbb" | grep -v "FIFA 16 GPU.app" && { echo "libbb* outside the bundle"; exit 1; }
 "$HM/bbgpu-host-macos26" 2>&1 | head -2 || true
-(cd "$OUT" && rm -f "FIFA16-macOS-$ver.zip" && ditto -c -k --keepParent "FIFA 16.app" "FIFA16-macOS-$ver.zip" && du -sh "FIFA16-macOS-$ver.zip" | cut -f1)
+(cd "$OUT" && rm -f "FIFA16-macOS-$ver.zip" && ditto -c -k --norsrc --keepParent "FIFA 16.app" "FIFA16-macOS-$ver.zip" && du -sh "FIFA16-macOS-$ver.zip" | cut -f1)
