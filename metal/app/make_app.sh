@@ -6,7 +6,7 @@
 set -euo pipefail
 ver=${1:?version, e.g. v0.3.0}
 HERE=$(cd "$(dirname "$0")" && pwd); OUT="$HERE/out"; rm -rf "$OUT"; mkdir -p "$OUT"
-L=~/fifa_metal/launcher; S=~/fifa_metal/shadps4-metal/build; B=~/fifa_metal/bloodborne_mac_port
+L=~/fifa_metal/launcher; S=~/fifa_metal/shadps4-metal/build; B=~/fifa_metal/fifa16_mac_port
 LIBS=(libSDL3.0.dylib libavformat.61.dylib libavcodec.61.dylib libswscale.8.dylib libswresample.5.dylib libavutil.59.dylib)
 
 echo "== launcher"; (cd "$L" && bash build.sh >/dev/null); cp -R "$L/FIFA 16.app" "$OUT/"

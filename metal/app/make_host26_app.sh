@@ -6,7 +6,7 @@
 # --no-macos27 drops bbgpu-host-macos27 so the plain host (and its re-exec) runs on this Mac (testing).
 set -euo pipefail
 ver=${1:?version}; BASE=${2:-$HOME/fifa_metal/app/out_mods/FIFA 16.app}; NO27=${3:-}
-B=~/fifa_metal/bloodborne_mac_port; OUT=~/fifa_metal/app/out_host26; rm -rf "$OUT"; mkdir -p "$OUT"
+B=~/fifa_metal/fifa16_mac_port; OUT=~/fifa_metal/app/out_host26; rm -rf "$OUT"; mkdir -p "$OUT"
 cp -R "$BASE" "$OUT/"; APP="$OUT/FIFA 16.app"; HM="$APP/Contents/Helpers/FIFA 16 GPU.app/Contents/MacOS"
 cp "$B/out/bbgpu-host" "$B/out/bbgpu-host-macos26" "$B/out/gpu-arm64/libbbhost.dylib" "$HM/"
 cp "$HOME/fifa_metal/app/run.sh" "$APP/Contents/Resources/run.sh"; chmod +x "$APP/Contents/Resources/run.sh"   # in-process fallback

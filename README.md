@@ -15,5 +15,5 @@ Apple Silicon Mac. Code lives in sibling repos; this one holds the glue, launch/
 | `notes/` | project memory notes (setup, hybrid renderer history, fifamod, lessons) | Claude project memory |
 
 Related repos: `fifa16-mods` (fifamod mod manager + PS4 asset fixers), `shadps4-fifa` (emulator
-branches `metal-hybrid` and `rain-probe`), `fifa_mac_port` (branch `fifa-hybrid`, the Metal GPU
+branches `metal-hybrid` and `rain-probe`), `fifa16_mac_port` (branch `fifa-hybrid`, the Metal GPU
 library and host; its Releases carry the finished FIFA 16.app, currently v0.4.7). Game data, the FIP patch and mod content are not in any repo.

@@ -6,4 +6,4 @@ FIFA 16 on Apple Silicon - bundled release (everything except the game)
 
 Contents: FIFA 16.app (launcher), payload/ (emulator Custom-metal build, Metal GPU library and
 host, runtime libraries, run.sh, renderer settings, host app bundle, fifamod).
-Full guide, build-from-source and troubleshooting: https://github.com/VladZ97/fifa_mac_port
+Full guide, build-from-source and troubleshooting: https://github.com/VladZ97/fifa16_mac_port

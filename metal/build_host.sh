@@ -1,7 +1,7 @@
 #!/bin/bash
 # fifa-hybrid: builds bbgpu-host (native arm64) against out/gpu-arm64/libbbgpu.dylib.
 set -euo pipefail
-cd ~/fifa_metal/bloodborne_mac_port
+cd ~/fifa_metal/fifa16_mac_port
 ROOT=$PWD; ARM64_PREFIX=$ROOT/deps/arm64
 host_cc=(/usr/bin/clang -arch arm64 -mmacosx-version-min=15.0 -std=c11 -O2 -g -Wall -Wextra -Werror
     -I. host/main.c host/host_runtime.c -Lout/gpu-arm64 -lbbgpu -Wl,-rpath,"$ROOT/out/gpu-arm64"

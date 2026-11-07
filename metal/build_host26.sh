@@ -5,7 +5,7 @@
 # host/main.c and host/host_runtime.c, the runtime_* callbacks resolved at link time; bbgpu-host-macos26 is a
 # stub executable carrying only the two pinned ranges (host/stub_main.c). Run after build_gpu_arm64.sh.
 set -euo pipefail
-cd ~/fifa_metal/bloodborne_mac_port
+cd ~/fifa_metal/fifa16_mac_port
 ROOT=$PWD; G=out/gpu-arm64; OBJ=$G/host26; mkdir -p "$OBJ"
 CC=(/usr/bin/clang -arch arm64 -mmacosx-version-min=15.0 -std=c11 -O2 -g -Wall -Wextra -Werror -I. -DBBGPU_HOST_MAIN=bbgpu_host_main)
 "${CC[@]}" -c host/main.c -o "$OBJ/main.o"

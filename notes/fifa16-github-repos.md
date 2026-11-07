@@ -5,7 +5,10 @@ metadata:
   type: reference
 ---
 
-Created 2026-11-06 (all private, account VladZ97, https remote named `private` in the clones):
+Created 2026-11-06 (all private, account VladZ97). Remote names differ: `private` in bloodborne_mac_port and
+shadps4-metal, `origin` in ~/FIFA16Mods and ~/fifa16-shadps4-tools (a push to the wrong name fails with
+"correct access rights"). `gh release create --target` needs the FULL sha. Zips built on the exFAT SSD carry
+`._*` AppleDouble entries: strip with `zip -d x.zip '*/._*'` before uploading.
 - https://github.com/VladZ97/fifa16-mods  <- ~/FIFA16Mods (fifamod.py, tools/, README; .gitignore
   excludes merged/, stock/data/sceneassets/ (extracted game assets), *.dylib)
 - https://github.com/VladZ97/fifa16-shadps4-tools  <- assembled copy in ~/fifa16-shadps4-tools
@@ -13,14 +16,16 @@ Created 2026-11-06 (all private, account VladZ97, https remote named `private` i
 - https://github.com/VladZ97/shadps4-fifa  <- ~/fifa_metal/shadps4-metal branch metal-hybrid and
   ~/fifa_perf/shadps4 branch rain-probe (both blob:none partial clones of upstream: push in
   slices, scratchpad chunkpush.sh pattern, http.postBuffer 500 MB, HTTP/1.1)
-- https://github.com/VladZ97/fifa_mac_port (renamed from bloodborne_mac_port-fifa 2026-11-06; README = full
+- https://github.com/VladZ97/fifa16_mac_port (renamed from fifa_mac_port 2026-11-07, before that bloodborne_mac_port-fifa; README = full
   getting-started guide; Releases: v0.1.0 launcher only; v0.2.0 = self-contained bundle
   FIFA16-macOS-v0.2.0.zip (install.sh --game <dir>; emulator + libbbgpu + host + runtime dylibs + run.sh + fifamod),
   recipe in fifa16-shadps4-tools/release/make_bundle.sh); v0.3.0 (2026-11-06) = ONE self-contained FIFA 16.app:
   emulator+libbbgpu+host+dylibs inside, rpaths @executable_path, bundled run.sh, four folders chosen in the launcher
   (game/update/mods/saves) -> env FIFA_* -> SHAD_USER_DIR/SHAD_UPDATE_DIR/SHAD_MODS_DIR/SHAD_DOWNLOAD_DIR/SHAD_HOME_DIR
-  (emulator commit 0f94446). Build: ~/fifa_metal/app/make_app.sh <ver> (launcher sources ~/fifa_metal/launcher,
-  GAME_ART_DIR=<sce_sys> for the icon). Data dir ~/Library/Application Support/FIFA 16/. Installed copy in ~/Applications.  <- ~/fifa_metal/bloodborne_mac_port
+  (emulator commit 0f94446); v0.4.7 (2026-11-07, Latest; v0.3.0 release+tag deleted on request) = macOS 26 host,
+  Mods page + compiled engine with 7zz/unrar, saves fix, isolation; port commit 22d7434, tools 3684804,
+  mods e5719e8 (main = app-engine), emulator d874f3a. Build: ~/fifa_metal/app/make_app.sh <ver> (launcher sources ~/fifa_metal/launcher,
+  GAME_ART_DIR=<sce_sys> for the icon). Data dir ~/Library/Application Support/FIFA 16/. Installed copy in ~/Applications.  <- ~/fifa_metal/bloodborne_mac_port (symlink ~/fifa_metal/fifa16_mac_port -> it; scripts and README use the new name)
   branches fifa-hybrid + master (was a shallow clone: `git fetch --unshallow origin` first)
 - https://github.com/VladZ97/pes2fifa  <- ~/FIFA16Mods/tools/pes2fifa (also tracked inside fifa16-mods);
   update with `git subtree split --prefix=tools/pes2fifa -b tmp && git push <url> tmp:main`
