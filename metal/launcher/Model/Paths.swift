@@ -5,6 +5,8 @@
 import Foundation
 
 struct Paths: Equatable {
+    /// Data folder name (~/Library/Application Support/FIFA 16): kept across the rename to F16.app so
+    /// existing settings, caches and saves stay where they are.
     static let appName = "FIFA 16"
     static let titleID = "CUSA02138"
 

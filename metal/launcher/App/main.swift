@@ -13,7 +13,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model = LauncherModel()
         let window = NSWindow(contentRect: NSRect(origin: .zero, size: LauncherView.size),
                               styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView], backing: .buffered, defer: false)
-        window.title = "FIFA 16"
+        window.title = "F16"
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
         window.contentView = NSHostingView(rootView: LauncherView(model: model))
@@ -41,7 +41,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard model.phase == .running, !quitting else { return .terminateNow }
         // As with run.sh, the game outlives the launcher unless asked; the next launch reattaches.
         let alert = NSAlert()
-        alert.messageText = "FIFA 16 is running"
+        alert.messageText = "The game is running"
         alert.informativeText = "Stop the game, or keep it running? Reopening the launcher shows its Stop button again."
         alert.addButton(withTitle: "Stop Game and Quit")
         alert.addButton(withTitle: "Keep Playing and Quit")
@@ -136,11 +136,11 @@ MainActor.assumeIsolated {
     let appItem = NSMenuItem()
     menu.addItem(appItem)
     let appMenu = NSMenu()
-    appMenu.addItem(withTitle: "About FIFA 16 Launcher", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+    appMenu.addItem(withTitle: "About F16", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
     appMenu.addItem(.separator())
     appMenu.addItem(withTitle: "Hide", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
     appMenu.addItem(.separator())
-    appMenu.addItem(withTitle: "Quit FIFA 16 Launcher", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+    appMenu.addItem(withTitle: "Quit F16", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
     appItem.submenu = appMenu
     let editItem = NSMenuItem()
     menu.addItem(editItem)

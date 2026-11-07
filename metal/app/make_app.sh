@@ -2,16 +2,16 @@
 # Assembles the self-contained FIFA 16.app: the launcher (launcher/build.sh), the emulator and its
 # libraries, the GPU library and host, run.sh, settings, fifamod. Fixes the library search paths
 # so nothing points outside the bundle, signs it ad hoc and zips it.
-#   bash make_app.sh <version>      -> ~/fifa_metal/app/out/FIFA 16.app and FIFA16-macOS-<version>.zip
+#   bash make_app.sh <version>      -> ~/fifa_metal/app/out/F16.app and F16-macOS-<version>.zip
 set -euo pipefail
 ver=${1:?version, e.g. v0.3.0}
 HERE=$(cd "$(dirname "$0")" && pwd); OUT="$HERE/out"; rm -rf "$OUT"; mkdir -p "$OUT"
 L=~/fifa_metal/launcher; S=~/fifa_metal/shadps4-metal/build; B=~/fifa_metal/fifa16_mac_port
 LIBS=(libSDL3.0.dylib libavformat.61.dylib libavcodec.61.dylib libswscale.8.dylib libswresample.5.dylib libavutil.59.dylib)
 
-echo "== launcher"; (cd "$L" && bash build.sh >/dev/null); cp -R "$L/FIFA 16.app" "$OUT/"
-rm -rf "$L/FIFA 16.app"   # the skeleton has no payload: never leave it around to be opened by mistake
-APP="$OUT/FIFA 16.app"; RES="$APP/Contents/Resources"; EMU="$RES/emulator"; HLP="$APP/Contents/Helpers"
+echo "== launcher"; (cd "$L" && bash build.sh >/dev/null); cp -R "$L/F16.app" "$OUT/"
+rm -rf "$L/F16.app"   # the skeleton has no payload: never leave it around to be opened by mistake
+APP="$OUT/F16.app"; RES="$APP/Contents/Resources"; EMU="$RES/emulator"; HLP="$APP/Contents/Helpers"
 mkdir -p "$EMU" "$HLP"
 
 echo "== emulator (x86-64) + libraries"
@@ -60,4 +60,4 @@ codesign --verify --deep --strict "$APP" && echo "signature ok"
 echo "== smoke: the bundled emulator resolves its libraries"
 if arch -x86_64 "$EMU/shadps4" --help >/dev/null 2>"$OUT/smoke.err"; then echo "emulator loads"; else grep -m2 -i 'dyld\|library' "$OUT/smoke.err" || true; fi
 du -sh "$APP" | cut -f1
-(cd "$OUT" && rm -f "FIFA16-macOS-$ver.zip" && ditto -c -k --keepParent "FIFA 16.app" "FIFA16-macOS-$ver.zip" && du -sh "FIFA16-macOS-$ver.zip" | cut -f1)
+(cd "$OUT" && rm -f "F16-macOS-$ver.zip" && ditto -c -k --norsrc --keepParent "F16.app" "F16-macOS-$ver.zip" && du -sh "F16-macOS-$ver.zip" | cut -f1)

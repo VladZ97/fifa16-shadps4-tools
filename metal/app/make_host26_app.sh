@@ -7,7 +7,7 @@
 set -euo pipefail
 ver=${1:?version}; BASE=${2:-$HOME/fifa_metal/app/out_mods/FIFA 16.app}; NO27=${3:-}
 B=~/fifa_metal/fifa16_mac_port; OUT=~/fifa_metal/app/out_host26; rm -rf "$OUT"; mkdir -p "$OUT"
-cp -R "$BASE" "$OUT/FIFA 16.app"; APP="$OUT/FIFA 16.app"; HM="$APP/Contents/Helpers/FIFA 16 GPU.app/Contents/MacOS"
+cp -R "$BASE" "$OUT/F16.app"; APP="$OUT/F16.app"; HM="$APP/Contents/Helpers/FIFA 16 GPU.app/Contents/MacOS"
 cp "$B/out/bbgpu-host" "$B/out/bbgpu-host-macos26" "$B/out/gpu-arm64/libbbhost.dylib" "$HM/"
 cp "$HOME/fifa_metal/app/run.sh" "$APP/Contents/Resources/run.sh"; chmod +x "$APP/Contents/Resources/run.sh"   # in-process fallback
 for f in "$HM/bbgpu-host" "$HM/bbgpu-host-macos26" "$HM/libbbhost.dylib"; do
@@ -20,7 +20,7 @@ done
 otool -l "$HM/libbbhost.dylib" | grep -q '@loader_path' || install_name_tool -add_rpath @loader_path "$HM/libbbhost.dylib"
 [ "$NO27" = "--no-macos27" ] && rm -f "$HM/bbgpu-host-macos27"
 if [ "${WITH_ENGINE:-}" = 1 ]; then rm -rf "$APP/Contents/Resources/fifamod"; cp -R ~/fifa_metal/app/work_mods/pkg/fifamod "$APP/Contents/Resources/fifamod"; cp ~/fifa_metal/app/engine/README.md "$APP/Contents/Resources/fifamod/" 2>/dev/null; echo "mod engine replaced"; fi
-if [ "${WITH_LAUNCHER:-}" = 1 ]; then install -m755 ~/fifa_metal/launcher/out/FIFA16Launcher "$APP/Contents/MacOS/FIFA 16"; echo "launcher replaced"; fi
+if [ "${WITH_LAUNCHER:-}" = 1 ]; then rm -f "$APP/Contents/MacOS/FIFA 16"; install -m755 ~/fifa_metal/launcher/out/FIFA16Launcher "$APP/Contents/MacOS/F16"; cp ~/fifa_metal/launcher/F16.app/Contents/Info.plist "$APP/Contents/Info.plist"; echo "launcher replaced"; fi
 if [ "${WITH_EMULATOR:-}" = 1 ]; then   # the rebuilt emulator (shadps4-metal/build), rpaths made bundle-relative as make_app.sh does
     EMU="$APP/Contents/Resources/emulator"; cp ~/fifa_metal/shadps4-metal/build/shadps4 "$EMU/shadps4"
     for rp in $(otool -l "$EMU/shadps4" | awk '/LC_RPATH/{getline; getline; print $2}'); do
@@ -44,4 +44,4 @@ done
 # still carries this Mac's deps rpath, so here they come from there, as in the shipped app).
 DYLD_PRINT_LIBRARIES=1 "$HM/bbgpu-host-macos26" 2>&1 | grep -E "dyld\[.*\]: <" | sed 's/.*> //' | grep "libbb" | grep -v "FIFA 16 GPU.app" && { echo "libbb* outside the bundle"; exit 1; }
 "$HM/bbgpu-host-macos26" 2>&1 | head -2 || true
-(cd "$OUT" && rm -f "FIFA16-macOS-$ver.zip" && ditto -c -k --norsrc --keepParent "FIFA 16.app" "FIFA16-macOS-$ver.zip" && du -sh "FIFA16-macOS-$ver.zip" | cut -f1)
+(cd "$OUT" && rm -f "F16-macOS-$ver.zip" && ditto -c -k --norsrc --keepParent "F16.app" "F16-macOS-$ver.zip" && du -sh "F16-macOS-$ver.zip" | cut -f1)

@@ -1,7 +1,7 @@
 # FIFA 16 launcher (self-contained app)
 
 A macOS launcher for FIFA 16 (PS4, CUSA02138) on the shadPS4 Metal hybrid build. Everything
-except the game ships inside **FIFA 16.app**: the emulator, the Metal GPU library and its host
+except the game ships inside **F16.app**: the emulator, the Metal GPU library and its host
 process, the runtime libraries, the launch logic and the mod manager. The user chooses four
 folders in the launcher and presses Play. Modelled on the Bloodborne port's launcher: plain
 `swiftc`, SwiftUI, an ad-hoc signed bundle, the icon made from the game's `sce_sys` artwork.
@@ -20,7 +20,7 @@ launch, with no game folder set, the window says so and Play stays disabled.
 
 ## What Play does
 
-Play runs `/bin/bash "FIFA 16.app/Contents/Resources/run.sh" <mode>` with these variables
+Play runs `/bin/bash "F16.app/Contents/Resources/run.sh" <mode>` with these variables
 added to the app's environment (PATH replaced by the login shell's PATH via `zsh -l`, LANG
 `en_US.UTF-8` when missing, `__CFBundleIdentifier` removed):
 
@@ -51,13 +51,13 @@ created on first Play), Shader cache (file count under `user/cache/CUSA02138`).
 ## Where things are
 
 ```
-FIFA 16.app/Contents/MacOS/FIFA 16                       the launcher (arm64)
-FIFA 16.app/Contents/Resources/run.sh                    launch logic
-FIFA 16.app/Contents/Resources/bbport.ini                renderer settings
-FIFA 16.app/Contents/Resources/config.template.json      emulator config template
-FIFA 16.app/Contents/Resources/emulator/shadps4          the emulator (x86-64) and its dylibs
-FIFA 16.app/Contents/Resources/fifamod/fifamod.py        mod manager
-FIFA 16.app/Contents/Helpers/FIFA 16 GPU.app             the GPU host app (bbgpu-host, -macos27, dylibs)
+F16.app/Contents/MacOS/F16                       the launcher (arm64)
+F16.app/Contents/Resources/run.sh                    launch logic
+F16.app/Contents/Resources/bbport.ini                renderer settings
+F16.app/Contents/Resources/config.template.json      emulator config template
+F16.app/Contents/Resources/emulator/shadps4          the emulator (x86-64) and its dylibs
+F16.app/Contents/Resources/fifamod/fifamod.py        mod manager
+F16.app/Contents/Helpers/FIFA 16 GPU.app             the GPU host app (bbgpu-host, -macos27, dylibs)
 
 ~/Library/Application Support/FIFA 16/                   data folder (everything writable)
   settings.json   the four folders and the options     state.json   pid of the game the launcher started
@@ -69,18 +69,18 @@ FIFA 16.app/Contents/Helpers/FIFA 16 GPU.app             the GPU host app (bbgpu
 ## Command line
 
 ```
-"FIFA 16.app/Contents/MacOS/FIFA 16" --cli status             the checklist and the game's state
-"FIFA 16.app/Contents/MacOS/FIFA 16" --cli env                the command and the variables Play adds
-"FIFA 16.app/Contents/MacOS/FIFA 16" --cli set gameDir /path  settings from Terminal (keys: gameDir,
+"F16.app/Contents/MacOS/F16" --cli status             the checklist and the game's state
+"F16.app/Contents/MacOS/F16" --cli env                the command and the variables Play adds
+"F16.app/Contents/MacOS/F16" --cli set gameDir /path  settings from Terminal (keys: gameDir,
                                       updateDir, modsDir, savesDir, fullscreen, lowLatency, frameStats, metalHUD, mode)
-"FIFA 16.app/Contents/MacOS/FIFA 16" --cli play [--force]     refuses while another shadps4 runs unless forced
-"FIFA 16.app/Contents/MacOS/FIFA 16" --cli stop
+"F16.app/Contents/MacOS/F16" --cli play [--force]     refuses while another shadps4 runs unless forced
+"F16.app/Contents/MacOS/F16" --cli stop
 ```
 
 ## Build and test
 
 ```
-bash build.sh          # out/FIFA16Launcher and the bare FIFA 16.app (Info.plist, icon, launcher)
+bash build.sh          # out/FIFA16Launcher and the bare F16.app (Info.plist, icon, launcher)
 bash build.sh --test   # builds and runs Tests/main.swift first (PASS: n checks, or exit 1)
 swift art/draw_icon.swift art/icon.png     # redraw the icon (checked in as art/icon.png)
 ```
