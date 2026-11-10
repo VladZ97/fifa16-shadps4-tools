@@ -4,7 +4,7 @@
 set -e
 export PATH="/opt/homebrew/opt/python@3.15/bin:/opt/homebrew/opt/llvm/bin:/opt/homebrew/bin:$PATH"
 export HOMEBREW_NO_AUTO_UPDATE=1
-cd "/private/tmp/claude-501/-Volumes-SanDiskSSD-F16-02138-extracted-F16-02138-FIFA-16---CUSA02138---Update-1-07-FIFA-16-CUSA02138/dbbed053-17e5-4d95-b585-d31d29a90051/scratchpad/build/shadps4"
+cd "${FIFA_SCRATCH:?set FIFA_SCRATCH to the build scratch folder}/build/shadps4"
 echo "source: $(git rev-parse --short HEAD)  (main 3eecea9 + local patches)"
 cmake --fresh -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=x86_64 2>&1 | tee build-configure.log | tail -3
 cmake --build build --parallel 8 2>&1 | tee build.log | grep -E "error:|FAILED|Linking CXX executable|\[[0-9]+/[0-9]+\] Linking" | tail -20

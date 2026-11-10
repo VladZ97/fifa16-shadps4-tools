@@ -121,6 +121,9 @@ case "$MODE" in
       if [ -z "$FPSV" ]; then FST=$(grep -a "\[FSTAT\]" "$DIR/emulator.log" 2>/dev/null | tail -1); [ -n "$FST" ] && FPSV=$(echo "$FST" | sed -E 's/.*fps=([0-9]+).*/\1/') && [ "$STATE" = in_match ] && echo "${T}s ${FST#*\] }" >> "$REPORT"; fi
       HUDV=$(echo "$TXT" | grep -oE "\|[0-9]+\.[0-9]+\|[0-9]+\. ?[0-9]+ms\|[0-9]+\. ?[0-9]+ms" | head -1 | tr -d ' ')
       if echo "$TXT" | grep -qE "\|[0-9]{2}:[0-9]{2} .*(BAR|RMA)|BAR.?[0-9].*RMA|(LALIGA|EA SPORTS)\|[0-9]{2}:[0-9]{2}\|"; then NEW=in_match; ACT=""; fi
+      # 2026-11-09: the FIP scoreboard OCRs without the team names; the match clock plus the player
+      # indicator ("7 V. VINI JR.", "PEDRI 8") identifies the match.
+      if echo "$TXT" | grep -qE "\|[0-9]{2}:[0-9]{2}\|" && echo "$TXT" | grep -qE "[0-9]{1,2} [A-Z]\. [A-Z]|[A-Z]{3,} [0-9]{1,2}\|"; then NEW=in_match; ACT=""; fi
       [ -z "${NEW:-}" ] && NEW="$STATE"
       if [ "$NEW" != "$STATE" ]; then echo "${T}s: $STATE -> $NEW (fps=${FPSV:-?})" | tee -a "$REPORT"; STATE="$NEW"; SAME=0; else SAME=$((SAME+1)); fi
       # --- automatic health checks (every sample) ---

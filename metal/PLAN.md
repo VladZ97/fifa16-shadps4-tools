@@ -977,3 +977,618 @@ separately). Launcher: ModEngine.firstVolume (queue a volume set once), FIFAMOD_
 Tests: 136 (multi-volume 7z from part 3, orphan part refused, firstVolume patterns). v0.4.7 = v0.4.6 + engine;
 SSD "FIFA 16 v0.4.7.app". FIP 9.0 full install into the scratch library (fifa_side/fiptest) running at the time
 of writing; its result decides whether v0.4.7 stands.
+
+## 2026-11-09 — all open performance + stability items (session started 06:30)
+Order of work: baseline measurements (dev run.sh now points at host_app/"F16 GPU.app"; autotest drive mode with
+VIS_STATES=none because the reference images predate the FIP theme) -> small items (shader-cache seed, relay spin
+core gate, 120 Hz vblank trial, direct read-back day match, block-shadow mips) -> encoder-split removal for the
+game's tiny dispatches (BB_DEFER_CS) -> memory-pressure repro for the slow-GPU state -> deadlock loop.
+- Shader cache seed (libbbgpu bbgpu.cpp SeedShaderCache): BB_SHADER_SEED_DIR=<dir>/<serial> copied once into the
+  user cache (when it has no metal/pipelines.binaryarchive), BB_SHADER_SEED=0 skips. app/run.sh exports it when
+  Resources/shader_seed exists; app/make_shader_seed.sh collects the dev cache (33 MB: 429 spv + 452 MSL + archive);
+  make_app.sh / make_host26_app.sh (WITH_SEED=1) ship it.
+- Deferred dispatches (BB_DEFER_CS=<max groups>, default 64; 0 = off): DispatchRecord hands a small dispatch
+  issued inside a render pass to Rasterizer::TryDeferDispatch instead of scheduler.EndRendering(); the pass-end
+  hook (before the deferred copy-shader copies) records them after the pass. Conflicts flush them first:
+  BindResources (descriptor ranges of the next command: buffers by V#, images by an upper bound of the T#'s
+  bytes), OrderAccesses (vertex/index reads, bound images incl. attachments, with written flags in the new
+  bound_images_written), buffer-cache uploads (SynchronizeMemory), CPU read-backs (ReadMemory window,
+  DownloadSmallAsync), texture-cache downloads/refreshes (by guest range; a block shadow stands for its BC
+  image), DMA CopyBuffer/FillBuffer. Not deferred: dispatches touching the open pass's attachments, GDS/special
+  buffers, uses_dma shaders, while copies are deferred, indirect dispatches, with the draw pipe or the upscaler.
+  Frame stats print "deferred dispatches N (M conflicts)". The flush keeps the caller's binding state (the hook
+  runs between a draw's BindResources and its recording).
+- 07:12 diag run (old library, open play after kick-off): 60 fps, GPU busy 8.0-8.7 ms/frame, 345-380 draws/frame,
+  GPU thread 13 us/draw idle 65%, latency 25.5-27 ms. GPU profile (segments/frame): "(after a submission,
+  unmarked)" 6.7 ms; tiny dispatches cs 87cfc5cc 4x1x1 x44/frame 1.4 ms, cs 513b88d5 2x1x1 x44 1.3 ms, cs 3ba88f63
+  1x1x1 x10 1.0 ms, cs 3327c37b 1x1x1 x4 0.6 ms = ~100 small dispatches and ~4.3 ms of segment time per frame,
+  the target of BB_DEFER_CS. BCVIEW: one BC3 1024 lv1 kit sampled through a 256x256 uint view; no [BCSKIP]
+  (no mip-level storage view in a short match: the replay case needs a long match, chain4).
+- Harness: the FIP scoreboard OCRs without team names, so drive mode never saw in_match and kept pressing cross
+  in the match; fifa_autotest.sh now also accepts the clock plus a player indicator ("7 V. VINI JR.").
+- 07:18 ctrl (new lib, BB_DEFER_CS=0): MATCH_OK, 58.9 avg; open play 60 fps GPU 9 ms, cutscene phases 54-58 fps
+  at 740-890 draws, GPU 13-16 ms (the crowd/close-up limit). 07:22 defer (BB_DEFER_CS=64): MATCH_OK but
+  "deferred dispatches 0.0": nothing was deferred, because every compute shader binds a non-guest buffer type
+  (IsSpecial covers Flatbuf/ReadConst and SharedMemory stand-ins, not only GDS). Fixed: only GdsBuffer declines;
+  BB_DEFER_CS_LOG=1 prints the first declines with their reason. That run's 54.6 avg / 44 fps cutscenes with the
+  GPU at 14 ms is run-to-run variance (host->flip packet 14 ms vs 5-7: a slower CP phase), not the change.
+  Slow-frame profiles show the hitches: kit composites (R8G8B8A8 2048 upload 28 ms, BC3 1024 download 6.6 ms,
+  R32G32B32A32Uint 256 download 53 ms) during cutscenes.
+- 07:27 vblank120 (BB_VBLANK_HZ=120, deferral off): the game is NOT locked to 60: menus and the match preview ran
+  at 91-97 fps (GPU 10 ms busy 95-98%, "frame prep" 4 ms, flip->submitted 5-7 ms, latency 39-40 ms). Then the
+  drill loading screen ("START") froze for 61 s and the harness stopped the run (no sample taken: the frozen-
+  picture path did not sample; fifa_autotest2.sh now samples the game and the host there). Whether the 120 Hz
+  vblank triggers the match-load deadlock or the drive pressed the wrong button is open: vblank120b repeats it.
+  Control clock speed at 60 Hz: ~2.3 game-seconds per wall-second in open play (clockspeed.sh on the shots).
+- 07:31 spin0 (BB_RELAY_SPIN_US=0): MATCH_OK 59.9 avg, latency 26.4-27.6 ms (ctrl 25.7-36.5), 23 hitch windows
+  both. The spin buys nothing on this 8-core M1 Pro: host/main.c now defaults the window to 0 on Macs with 8 or
+  fewer logical processors and 100 us above (BB_RELAY_SPIN_US overrides; the host logs the choice).
+- 07:36 rbdirect (BB_RB_DIRECT=2) on a daylight match: MATCH_OK 59.3 avg, latency 23-28 ms, 22 hitch windows (ctrl
+  23), kits/crowd/boards correct in the shots. The direct read-back queue is now the default in run.sh (dev and app).
+- 07:40 defer2 (GDS-only decline): still 0 deferred. BB_DEFER_CS_LOG: every dispatch declined as "capture or
+  upscaler": TemporalUpscaler::Enabled() is true for FIFA (the settings object), although it only acts on
+  Bloodborne's trigger shader and the reduced scene. The condition is now RasterScaling() (the upscaler's own
+  scene); rebuilt. The long match and the heavy-phase run (BB_DEFER_CS=64) are the first real deferral runs.
+- 07:45 vblank120b (BB_VBLANK_HZ=120): MATCH_OK this time (the earlier stall was the drive at the drill card, not
+  the game). In the match the game ran 52-65 fps (GPU 7.5-12 ms, worst frames 57-68 ms), and the match clock ran
+  4.3 game-seconds per wall-second against 2.3 at 60 Hz: FIFA 16 steps its simulation once per vblank, so a
+  120 Hz vblank is a 1.9x fast-forward. 120 fps therefore needs the simulation decoupled from the vblank count
+  (a game patch, not a renderer change); presenting at 120 Hz without the game producing 120 frames would mean
+  frame interpolation, for which the game gives no motion vectors. Not pursued further; 60 Hz stays.
+- 07:49 memtest (20 GiB hog, deferral off): MATCH_OK 59.6, GPU 8.3-9.7 ms, latency 25 ms, no "memory pressure"
+  evictions: the slow-GPU state did not reproduce. But the hog's pages were a constant fill (the compressor
+  folds them for free: swap stayed 0). memtest2 repeats it with incompressible pages touched continuously
+  (22 GiB, after the long match and the heavy-phase run).
+- 07:55 longmatch (10 min, BB_DEFER_CS=64 with the RasterScaling condition): MATCH_OK, 55.1 avg over 188 samples
+  (cutscenes 44 fps at 870 draws / GPU 14.5 ms, open play 60), visuals correct through a goal and the replay
+  (0-1 at 37:00), no [BCSKIP] in 10 minutes. Deferral now runs but barely: 1-3 dispatches/frame deferred and 2 of
+  3 flushed by a conflict, far from the ~100 small dispatches a frame. The library now logs each conflict
+  (BB_DEFER_CS_LOG: site bind/order/upload/readback/image-refresh/dma, the ranges that met); the soak runs carry
+  it. Hitch windows (FSTAT >50 ms frames): 188 of 397 2-s windows in the long match vs 22-31 of 127-144 in the
+  2-minute runs (the long match spans replays, celebrations and kit loads).
+- 08:08 heavyprof (BB_MIDFRAME_FLUSH_MS=0, BB_DEFER_CS=64): MATCH_OK 52.1 avg (cutscene 43.8 fps, 877 draws, GPU
+  13.7 ms). Deferral works for cs 513b88d5 (2x1x1, 51/frame, "deferred" in the profile) but its partner
+  cs 87cfc5cc (4x1x1, 51/frame) was flushed by the next dispatch's BindResources conflict check (it reads what
+  the previous wrote): each pair still split the pass. Fix: a compute pipeline no longer runs that check
+  (deferred, it is appended after the pending ones in order; not deferred, DispatchRecord's EndRendering runs
+  them first; its uploads over their ranges are still caught in the caches). GPU profile: even without the
+  mid-frame flush "(after a submission, unmarked)" holds 9.5-12.9 ms/frame: the game's own submissions cut the
+  open segment; the scheduler now resumes the open label after a submission (profiler Current/Resume).
+  Per-pass cost in the heavy phase will be readable in the soak runs' profiles.
+- 08:14 memtest2 (22 GiB incompressible hog): the host died at boot: "GPU stopped making progress (2096 ms)" ->
+  the GPU watchdog (BB_GPU_WATCHDOG_MS=2000) exited the host (status 75), the emulator followed. So the
+  slow-GPU state is the GPU itself slowing under system memory pressure (its memory paged), and when it drops
+  below one tick per 2 s the watchdog turns it into a crash. run.sh (dev and app) now defaults the watchdog to
+  5000 ms (a real hang still exits; a paging GPU gets room). Next: a memory-pressure source in the host
+  (dispatch memory-pressure events) that logs the state and tightens the texture cache's eviction marks, and
+  memtest3 at 14 GiB (the user's level) after the soak.
+- 08:16 soak1 (chained deferral, conflict log): 298 "order" conflicts in one match window: the deferred tiny
+  dispatch's write (e.g. 0x440d14300, 6.6 KB) meets the NEXT draw's vertex/index read range. The game generates
+  vertices in compute right before drawing them (skinning), so deferring to the pass end can never apply to
+  these. New approach, modelled on the upload hoisting: TryHoistDispatch records a small, buffer-only dispatch
+  into the ahead (upload) encoder, which runs before the whole submission, when none of its ranges is touched by
+  a command not yet complete (Runtime::AheadSafe = IsBufferAccessed empty apart from earlier ahead work; writes
+  only into the arena) and nothing deferred meets them. Its accesses are marked EncoderAhead, so the next draw
+  waits on the uploads' fence inside the open pass instead of splitting it. BB_HOIST_CS=<max groups> (64; 0 off),
+  BB_DEFER_CS_LOG prints "[HOIST] ... not hoisted: <why>". Frame stats: "dispatches hoisted N, deferred M".
+- 08:24 soak3 (chained deferral build): MATCH_OK 56.1; in the match 12 deferred/frame with 0 conflicts in open
+  play, up to 106/frame in cutscenes (2.8 conflicts): the chains work (profile: cs 87cfc5cc and 513b88d5 "deferred",
+  27/frame each, segments 0.47/0.29 ms vs 1.3/0.8 before). What the profile also shows: open play's GPU span is
+  18 ms for 8.7 ms of busy command buffers: the GPU waits for the host between the game's submissions. In
+  cutscenes (800-1150 draws) the GPU thread is 65-73% busy at 10-13 us/draw: those phases are as CPU-bound on
+  the host's command thread as GPU-bound. Next lever there: the draw pipeline (BB_DRAW_PIPE=1, stage-B
+  recording thread, off for FIFA so far) - queued as an A/B after the pressure run, then a final-defaults run.
+- 08:29 soak4 (hoisting build): MATCH_OK; 28-57 dispatches hoisted per frame, 1 deferred, 0 conflicts. Cutscene
+  GPU busy 13.7 ms at 889 draws (ctrl 16.2 at 892): ~2.5 ms of GPU per heavy frame saved, but the frame rate there
+  (44-45) and the open-play us/draw (15-20 vs 12-13) say the command thread paid for it: the hoisted dispatch was
+  recorded on the command thread itself (BindStage + dispatch into the ahead encoder). Now recorded by the
+  recording thread (a scheduler command that takes the upload lock), with the ranges noted as used by the
+  submission so a later hoisted upload cannot overtake it in the ahead stream.
+- 08:15-08:44 soak (6 matches, deferral/hoisting builds as they came): all MATCH_OK, no stall, no deadlock, no
+  sample taken (the frozen-picture sampler never fired). soak5/6 (hoisting on the recording thread not yet: that
+  build landed at 08:41): 59.4 / 57.5 avg, latency 22.9 / 26.4 ms, 49-51 hoisted + 2-4 deferred per frame,
+  <1 conflict. Together with the morning's runs that is 17 match loads without the rare match-load deadlock; the
+  harness now samples both processes if a picture freezes, so the next occurrence will carry a stack.
+- Block shadow mips: no [BCSKIP] (mip-level storage view of a block-compressed image) in any run today, including
+  the 10-minute match with a goal replay; the "flat brown shells" path was not exercised. The log stays (BB_BCVIEW_LOG)
+  and the fix waits for a capture; nothing changed blind.
+- 08:43 memtest3 (14 GiB incompressible hog touched continuously, the user's "24 of 32 GB" level): MATCH_OK 55.2,
+  open play 60 fps GPU 8-10 ms, cutscene 42-46 at 913 draws / 13.7 ms, no swap, no memory-pressure event from the
+  system: at this level macOS does not page the GPU process. The slow-GPU state needs real swapping (the user's
+  sessions had 8.6 GB swapped); memtest2 showed the end of that road (GPU ticks over 2 s -> watchdog exit). In
+  place now: watchdog 5 s, the pressure watcher (logs the level, tightens texture eviction).
+- 08:47 drawpipe (BB_DRAW_PIPE=1): the picture froze at the title screen (2 s frames, 4 draws/frame) and the
+  harness stopped it: the stage-B draw pipeline is not usable for FIFA (that is why run.sh keeps it off); the
+  samples are in the run folder. Off stays the default; the command-thread cost in cutscenes remains the limit
+  there (10-13 us/draw at 900-1150 draws).
+- 08:50 final1 (defaults: hoisting on the recording thread, chained deferral, direct read-back, watchdog 5 s):
+  MATCH_OK 55.1 avg, 49-72 hoisted + 2-15 deferred per frame, <1 conflict; open play 59 fps / GPU 8.2-10.6 ms,
+  latency 24.9 ms; cutscenes 45-50 fps at 824-836 draws with GPU 14.2-14.5 ms (ctrl: 16.2 at 892) and the
+  command thread 70-75% busy. Hitch windows 40 of 133 (ctrl 22-31 of 127-144): an A/B without the profiler,
+  twice each way (hoistoff1/hoiston1/hoistoff2/hoiston2), decides whether hoisting ships on by default.
+  memory_pressure -S (simulated levels) needs root on this Mac: the watcher's event path is untested; the
+  real-pressure path (memtest2) is what it was written for.
+- host_app/"F16 GPU.app" refreshed with the rebuilt hosts (spin gate) and re-signed.
+- 08:57-09:24 hoisting A/B (no profiler, twice each): hoistoff 59.9/59.9 avg, hoiston 59.0/59.0 (OCR samples; the
+  on runs sampled 20 windows incl. more cutscene time). Hitch windows 24/111, 25/120 (off) vs 27/133, 23/133 (on):
+  equal. Heavy windows (>=700 draws): off 52-58 fps at GPU 14.8-16.1 ms; on 50-59 fps at 11.3-15.4 ms, the second
+  on-run 57-59 fps at 12.3-13.5 ms. Open play GPU 6.6-10 ms on vs 7-10.4 off. Hoisting (77-87 dispatches/frame)
+  ships on by default; the cutscene limit is now the command thread (65-75% busy at 800-1150 draws).
+- 09:15 v0.5.1 candidate (app/make_perf_app.sh 0.5.1 -> app/out_perf/F16.app + F16-macOS-0.5.1.zip, 97 MB: v0.5.0
+  with the rebuilt libbbgpu arm64 + x86, libbbhost, the three hosts, run.sh and Resources/shader_seed; emulator,
+  launcher, engine unchanged). Validated in the isolated data_test folder with the cache deleted first: MATCH_OK
+  59.6 avg, "Shader cache: seeded 1649 files (30.8 MB)", 0 shader/pipeline compiles in all 44 stat windows,
+  "relay spin window 0 us (8 processors)". Nothing committed: bloodborne_mac_port has 15 modified files
+  (CHANGES-FIFA.md updated); ~/fifa_metal run.sh, app/run.sh, make_app.sh, make_host26_app.sh,
+  make_shader_seed.sh (new), make_perf_app.sh (new), shader_seed/ (new), host_app refreshed; ~/fifa_autotest.sh
+  (backup .bak_20261109), ~/fifa_autotest2.sh (new), app/work26/autotest_app.sh; the tools repo (metal/) needs the
+  copies.
+
+## 2026-11-09 — where the open items stand after this session
+- Prebuilt shader cache: DONE (seed in the bundle, first run compiles nothing).
+- Relay spin: DONE (0 us on <= 8 cores, A/B neutral).
+- 120 fps: NOT POSSIBLE in the renderer (simulation stepped per vblank: 1.9x game speed at 120 Hz); 60 stays.
+- Direct read-back queue: DONE (day match verified, default BB_RB_DIRECT=2).
+- Tiny-dispatch encoder splits: DONE differently than planned: the game generates vertices in compute right before
+  drawing, so the dispatches are hoisted ahead of the submission (77-87/frame), the rest chained to the pass end;
+  heavy-frame GPU 11-13.5 ms instead of 15-16. The cutscene limit is now the host command thread (the stage-B draw
+  pipeline stalls FIFA at the title: off).
+- Slow-GPU state: mechanism found (system paging makes GPU ticks take seconds; the 2 s watchdog then exits the
+  host). Mitigated: watchdog 5 s, memory-pressure watcher + earlier eviction. Not reproducible below real swapping.
+- Match-load deadlock: not reproduced in 21 match loads; the harness now samples both processes on a frozen picture.
+- Block-shadow mips / brown stadium shells: not exercised in any run (no mip-level BC storage view seen); unchanged.
+- Display refresh fallback: moot in split mode (the host's SDL is initialised; only BB_VBLANK_HZ=0 uses it).
+- Still CPU-bound in cutscenes (800-1150 draws at 10-13 us/draw on the command thread): the next lever would be
+  cheaper per-draw binding on the host (memoized texture sets already exist) or a working draw pipeline.
+
+## 2026-11-09 — 0.5.1-b round (user away; 0.5.1 kept as is)
+- 09:3x mid-frame flush A/B (base 3 ms, 1 ms, off, base again): no difference (hitch windows 24/134, 29/137, 25/133,
+  23/126; heavy phases 42-59 fps at 11.6-16 ms GPU in all four; open play 60). BB_MIDFRAME_FLUSH_MS stays 3.
+- Open-play command-thread samples: 99% idle (the thread waits for the game's submits at 60 fps); the per-draw
+  cost only matters in cutscenes, so the heavy-phase sampler (cutsample.sh) triggers on >= 700 draws/frame.
+- 09:50-11:22 the measurement queue was stuck: chainb2/3/4 each waited with `pgrep -f chainbN.sh`, and the pattern
+  also matched the text of the other waiters' own command lines (the shell wrapper carries the script source), so
+  after the baseline run nothing started for 90 min. Replaced by one sequential queue (chainc.sh), a queue guard
+  (qguard.sh: kills an autotest older than 1100 s, an emulator/host with no driver for 120 s, and a run whose
+  results file is idle for 480 s; logs GUARD lines) and a bounded runner (runq3.sh: wait capped at 1500 s, per-run
+  kill timer). Rule: chain on a pid (`kill -0`) or a lock file, never on a pgrep of a script name.
+- 11:22 imghoist (image-binding dispatch hoisting, link9): MATCH_OK 59.5, hoisted 64-88/frame (base 46-49), deferred
+  4-20, 0.1-0.2 conflicts, no Metal errors, picture correct. GPU busy by draws/frame identical to base_b2 (200-300
+  draws 8.8-9.0 ms, 800 draws 13.2-13.4 ms, 1300-1400 draws 14.7-15.0 ms): correct and harmless, no measurable gain.
+  Profile: the largest remaining in-pass split is dispatch cs 510f1e38, 240x135x1 groups, 14.5/frame, 3.95 ms/frame of
+  segment time for 1.89 ms of encoder time, declined "size" (367 of 400 logged declines). Queued bighoist
+  (BB_HOIST_CS=1e8) to learn whether the image/buffer rules allow it or it reads the pass.
+- 11:37 bighoist (BB_HOIST_CS=1e8): MATCH_OK 59.4, hoisted 52-70/frame; the 240x135x1 dispatch is declined "colour
+  attachment" (367/367): it binds the open pass's own colour target, so the split is the game's design (a compute pass
+  over the frame 11-14 times per frame, ~0.5 ms of bubble each on TBDR). Not fixable from the renderer; cap stays 64.
+- 11:34 drawpipe2 (BB_DRAW_PIPE=1): STALL at the title after 48 s (30-93 draws/frame at 45-60 fps before, worst
+  frames 134-1214 ms). Host: every thread parked (command thread in Process's wait, recorder in its cv wait with the
+  queue predicate, draw pipe threads idle). Game (eboot at 0x400000000, shadps4 at 0x700000000000): Game:Main in game
+  code with sceKernelNanosleep (a polling loop), job threads polling, the rest in semaphores/cond waits. So the game
+  polls a value the host never produces (a label or the flip status) and submits nothing more. Added a stall dump
+  (BB_STALL_DUMP_S, default 8: [STALL] lines with the pending fences, their current values and pipe positions, the
+  recorder queue and the deferred signals; bbgpu.cpp WatchStalls) and queued drawpipe3 to read it.
+- Command-thread cost found in the base_b1 sample (open play, 45% busy): 11% of the thread in the page-protection
+  round trip (host -> game's bb:GpuProtect thread -> host, ~0.1-0.2 ms each, two thread wake-ups: the host's wait
+  spins only ~2 us) under SynchronizeMemory uploads, QueueReadback/ProtectForCpuRead and UpdateImage; 4% in
+  HasOndemandIn (texture-cache mutex per ObtainBuffer); 5% PM4 decode. Added "Protects: N per frame, ms per frame"
+  to the frame stats and BB_PROTECT_SPIN_US (host_runtime.c; default 0 until the A/B: heavycpu2 vs heavycpu3=200).
+- 11:40 heavycpu2 (new "Protects:" line, no spin): 80-98 page-protection round trips per frame costing 1.5-2.8 ms
+  per frame in open play and 5.3-9.1 ms per frame in cutscenes (1200-1270 draws) on the command thread. That is
+  the largest CPU cost found in the port (half the cutscene frame budget). Fixes in flight for 0.5.1-b:
+  (a) ProtectForCpuRead (texture_cache.cpp) issued one page-manager call per 4 KiB page: now one per contiguous
+  run of pages whose count crosses zero; (b) HasOndemandIn answers without the texture-cache mutex when no
+  on-demand image exists (atomic ondemand_any); (c) BB_PROTECT_SPIN_US spins both ends of the round trip (the host's
+  wait in host_runtime.c, the game's bb:GpuProtect ring peek via the shared block's protect_spin_ns, formerly pad3)
+  before sleeping; default decided by the A/B heavycpu4 (0) vs heavycpu3b (200) on the new libraries.
+- 11:48 heavycpu3 EXITED in boot: the host aborted in the handshake because a build was relinking
+  out/gpu-arm64/libbbgpu.dylib (the host loads it from the build output) at that moment. Rule: builds take
+  $S/build.lock; runq3 waits for it before launching. The sampler (cutsample2.sh) also waited forever for a match
+  that never came and blocked the chain behind it: now bounded; qguard2.sh kills a sampler without a run (300 s).
+- 11:57 heavycpu4 (coalesced read watchers, lock-free HasOndemandIn, spin 0): protects 38-50/frame at 0.75-1.1 ms
+  in open play, 48-57/frame at 0.9-1.3 ms at 700-1475 draws (heavycpu2: 80-98 at 1.5-2.8 and 5-9 ms); command
+  thread 8-11.5 us/draw in heavy frames (was 13-15). 60 fps, worst frames 27-29 ms in open play.
+- 12:00 heavycpu3b (same + BB_PROTECT_SPIN_US=200 both ends): per-protect latency halves (open play 17-40 protects
+  at 0.15-0.6 ms/frame) but open play ran at 54-56 fps with 51-59 ms worst frames: the spinning game-side protect
+  thread takes a core from the game on this 8-core Mac. Default: spin only above 8 cores (100 us), like the relay.
+  The heavy samples (772-839 draws, the readback phase) still show 14% of the command thread in protect waits
+  under ForEachUploadRange (one waited round trip per region) and 8% in Scheduler::Finish for buffer downloads.
+- 12:15 batched protect waits: ForEachUploadRange posts every region's protect and waits once before the copies
+  (memory_tracker.h -> Core::ProtectBatch -> host_runtime.c runtime_memory_gpu_protect_batch, weak-imported so
+  the game-side library needs nothing). Safe because the copies (on_upload) already ran after the whole loop: a
+  guest write between a post and its application is included in the copy, a write after the wait faults.
+  Validation run "batchprot" queued behind drawpipe4.
+- 12:07 drawpipe4 dump (flip state + newest fences): flips done 1245 with 0 pending and empty request/swap queues,
+  deferred signals 11821/11821, recorder and pipe idle, "rendering 0"; the game submitted nothing for 8 s. The
+  newest fence (position 87704320, reached) expects 0xc039100000000001 as 8 bytes and the memory holds 0x1: the
+  upper dword looks like the following packet's PM4 header, i.e. a 32-bit label parsed as 64-bit, or the write
+  landed as 4 bytes. Whatever the game polls is not in the pending-fence list and not a flip. The draw pipe stays
+  off (BB_DRAW_PIPE=0); the [STALL] dump (BB_STALL_DUMP_S) remains in the build for the next attempt. Bounded
+  attempt closed here (3 captures).
+- 12:11 batchprot2 (batched protect waits, spin 0, new libraries): MATCH_OK 59.0, open play 60 fps with 25-32 ms
+  worst frames (one 45.6); protects 17-47/frame in open play at 0.06-0.36 ms/frame, 57-80/frame at 0.37-0.44 ms
+  in cutscenes (1043-1209 draws, 8.6-9.0 us/draw against 13-15 at the start of the day); heavy samples: the
+  remaining wait is the one batched round trip per upload (8-11% of the thread at 760-880 draws), PM4 decode 7%,
+  submit-queue mutex 5%. No Metal errors. The next lever would be one wait per draw (defer every binding's
+  on_upload to the end of BindResources) and the submit-queue mutex.
+- 12:18 packaged 0.5.1-b: OUT=app/out_perf_b bash app/make_perf_app.sh 0.5.1-b -> app/out_perf_b/F16.app +
+  F16-macOS-0.5.1-b.zip (97 MB); 0.5.1 in app/out_perf untouched. Contents against 0.5.1: image-binding dispatch
+  hoisting, coalesced read-watcher protects, lock-free HasOndemandIn, batched protect waits, BB_PROTECT_SPIN_US
+  (default 100 us above 8 cores, else 0), "Protects:" frame-stats line, [STALL] dump (BB_STALL_DUMP_S, default 8).
+  Nothing committed (SOURCES.txt's tag line is aspirational until the commits land).
+- 12:19 first app-harness validation of 0.5.1-b EXITED at match load: the queue guard (qguard2) saw an emulator
+  with no "fifa_autotest2.sh drive" process (the app harness's driver is autotest_app.sh) and killed it as an
+  orphan after 120 s. qguard3 recognises both drivers; validation rerun at 12:24. Harness note: the guard's driver
+  patterns must list every harness that launches the emulator.
+- 12:24 app-harness validation of 0.5.1-b (fresh seeded cache): MATCH_OK 59.5, 0 compiles, no errors; open play
+  38-50 protects/frame at 0.7-1.2 ms (the batched wait is now timed too; the thread is 60% idle there, the gain
+  is in the heavy phases). Copied to /Volumes/SanDiskSSD as "FIFA 16 v0.5.1-b.app" + F16-macOS-0.5.1-b.zip, next to
+  v0.5.1. Both untested by the user; nothing committed. Queue guard (qguard3.sh), build lock and bounded sampler
+  live in the session scratchpad; the tools repo still needs copies of the harness scripts.
+
+## 2026-11-09 — 0.5.1-c round ("take it to the max": every remaining command-thread lever, no confirmations)
+
+- 17:10 Heavy-phase sample of 0.5.1-b (batchprot2, cutscene, 2491 samples): protect round-trip waits still 8.8% (ulock under
+  SynchronizeMemory), the command loop's queue mutex lock/unlock 12.6% + ProcessCommands 2.8% = the WaitRegMem yield-spin,
+  _tlv_get_addr 5.8% (thread_local reads under every binding: Shader::Info::Snapshot via UserData), HasOndemandIn 1.8%,
+  PM4 decode 7%, BufferBarriers::Mark 2.6%, NoteSubmissionUse 2.6%, ReadbackWait 2%.
+- 17:07 spinprof run (BB_SPIN_PROF=1, 0.5.1-b): [SPIN] wrm-yield 9-20% at 4100-7700 waits/s = 70-130 WaitRegMem a frame that
+  are not met at first test; wrm-inpend 0 because without the draw pipe the EOP fences the recorder writes
+  (SignalAfterHostCopies) were never listed as pending, so the command thread spun until the recorder caught up.
+  MATCH_OK 60 fps, p99 22-28 ms, Protects 37-61/frame at 0.7-1.5 ms.
+- 17:20 Experiment (scratchpad tfp/): an arm64 helper can task_for_pid a Rosetta x86_64 process and mach_vm_protect its pages
+  when the TARGET is ad-hoc signed with com.apple.security.get-task-allow (no entitlement needed on the caller; the caller's
+  cs.debugger entitlement alone prompts for authorisation). The target faults on the next write as with mprotect.
+- 17:45 Built 0.5.1-c candidate 1:
+  * direct page protection (host_runtime.c host_protect_direct_init/protect_direct, main.c, host.h, bbgpu_shared.h tail
+    fields protect_direct/protect_lock/page_kind_addr/bytes, bbport_split.cpp SharedProtectGuard + mmap'd kind table):
+    the host changes the game's page protection itself (one mach_vm_protect per view, ~µs) instead of the ring relay
+    (~80 µs, two wake-ups); the game's fault handler and the host order through the shared spinlock; BB_PROTECT_DIRECT=0
+    or an emulator without get-task-allow → relay as 0.5.1-b. Harness emulator re-signed (backup .unsigned_bak);
+    make_perf_app.sh signs the bundled emulator with the entitlement.
+  * pending recorder fences (liverpool.cpp RecorderFenceDeferred): EOP fences deferred to the recorder are listed as
+    pending without the draw pipe too, so WaitRegMem is answered from the list; BB_PENDING_RECORDER_FENCES=0 restores.
+  * Shader::Info::snapshots_in_use fast path (no thread-local reads until the draw pipe installs snapshots).
+  * TextureCache on-demand 4 MiB chunk bitmap pre-check before the mutex.
+  * [SPIN] by_addr now counts memory WaitRegMem addresses (kind 1).
+  First build failed on pid_t in host.h (int now); chain restarted with the rebuilt hosts.
+- 17:31 direct1 (lib-side changes only: the harness host bundle still had the 0.5.1-b hosts, so protection relayed):
+  MATCH_OK 60 fps, p99 20-29 ms; [SPIN] wrm-yield 0.0% (0/s) against 9-20% at 4100-7700/s in spinprof: the pending
+  recorder fences remove the command thread's wait-spin entirely. Protects 30-40/frame at 0.9-1.1 ms (relay).
+- 17:32 direct2 EXITED in boot: the host hung in task_for_pid behind the "Developer Tools Access" dialog my entitlement
+  test (case D, debugger-entitled caller on a plain target) had left open; taskgated queues requests behind a pending
+  dialog. Dismissed the dialog (osascript Escape to SecurityAgent); task_for_pid now runs on a thread with a 1.5 s
+  limit (relay mode on timeout). Re-verified: entitled target + plain caller answers at once, no dialog.
+- 17:40 direct2b: host logs "direct page protection: the host changes the game's page protection itself (task port)".
+- 17:46 direct2b (direct protection + all lib changes): MATCH_OK, 60 fps, p99 22-30 ms, rendering correct (replay shot
+  checked). Protects 37-52/frame at 0.5-0.8 ms (≈12 µs each: one cross-task mach_vm_protect incl. TLB shootdown, no
+  wake-ups; relay was ≈27 µs each). [SPIN] 0%. Command thread at 350-450 draws/frame: 8.7-9.8 µs/draw against
+  11.5-12.9 in spinprof (0.5.1-b) — about 25% less per draw. Packaged as app/out_perf_c (F16-macOS-0.5.1-c.zip, 97 MB,
+  emulator signed with get-task-allow, "emulator: get-task-allow kept"). direct3 (heavy-phase sampler at >= 500
+  draws) and the app-harness validation (appval_c.log) queued.
+- 17:47 direct3 (heavy sampler at >= 500 draws, 3 samples at 533/687/894 draws): MATCH_OK. At 894-899 draws/frame the
+  command thread is 8.0-8.4 µs/draw and 27-45% idle (0.5.1-b: 10.2-10.4 µs/draw, 28% idle) while GPU busy is
+  13.5 ms/frame (74-77%): the GPU, not the command thread, limits cutscenes now (54-58 fps there, worst 39 ms).
+  Remaining command-thread self time: cvwait idle 34%, ReadbackWait 6% (cutscene CPU readbacks), PendingFenceValue 3.7%
+  (list grew to the 4096 cap: labels the game rewrites never "hold" their value), WaitHostCopies yield-spin 3%
+  (EOS/WriteData ordering), RunDmaData memmove 3%, _tlv_get_addr 2.6% (Regs() via stage_regs, ChunkUser, on_helper),
+  BufferBarriers::Mark 1.9%, getenv("BB_BCVIEW_LOG") per draw 0.9%, mach_vm_protect 1.1%.
+  Threads in that phase: GpuCommandProcessor 58% busy, MtlRecorder 39%, DrawPrep0 22%.
+- 17:55 Batch 2 edits (not yet built): pending fences pruned by the recorder's deferred-signal counters (PendingFence
+  signal_seq; Scheduler/Rasterizer DeferredSignalsIssued/Done), BB_BCVIEW_LOG cached, Rasterizer::Regs()/CbExtent/
+  CsRegs/DbExtent skip the thread-local until the draw pipe installs stage registers (stage_regs_used).
+- 17:58 appval_c (packaged candidate 1, fresh seeded cache, direct protection confirmed in its log): MATCH_OK, 60 fps,
+  p99 21-30 ms, 0 compiles, no errors. Copied to /Volumes/SanDiskSSD as "FIFA 16 v0.5.1-c.app" + zip (to be refreshed
+  with candidate 2 if direct4 and its validation pass). Batch 2 built; direct4 running with BB_GPU_PROFILE=1.
+- 18:02 direct4 (batch 2, BB_GPU_PROFILE=1): MATCH_OK; the profiler itself costs hitches (p99 50-60 ms) — direct5 without it:
+  MATCH_OK, heavy phase 55-57 fps at 887-898 draws, GPU busy 13.4 ms, open play 60 fps p99 26-28, command thread 7.2-7.4
+  µs/draw, 50-55% idle. Batch 2 verified in the sample (PendingFenceValue and the per-draw getenv gone).
+  GPU profile (cutscene, per frame): dispatch cs 510f1e38 (240x135 groups) x13 = 8.0 ms segment / 6.2 ms encoder
+  (0.47 ms each: a full-screen copy as compute, plus 13 pass splits); main 1080p pass 3.7 ms; 1x1x1 dispatches
+  3327c37b x5 (1.9 ms segments) and 3ba88f63 x13 (0.65 ms). The copy shader (SPIR-V in the seed): one
+  ImageSampleExplicitLod at ((gid+0.5)*buf[0..1]) LOD 0, one ImageWrite at gid, output = sample.zyxw, optional
+  depth remap (backend). 
+- 18:20 Batch 3 (built): copy dispatch as a fragment pass. CopyDispatchDetectPass (shader_recompiler/ir/passes/
+  copy_dispatch_detect_pass.cpp, after CollectShaderInfoPass) matches that shape generically and records it in
+  InfoPersistent::CopyDispatch (ShaderMetaVersionBase 11 -> 12: the cache and the bundled seed recompile once);
+  Rasterizer::PlanCopyDispatchPass (dst 2D colour, grid*workgroup == size, scale from the V# in guest memory, remap
+  bit from push_data) + BlitHelper::CopyDispatch (copy_dispatch_fs: sample at position*scale, remap, swizzle; clear +
+  store, no load). BB_COPY_CS_PASS=0 / BB_COPY_CS_DETECT=0 disable, BB_COPY_CS_LOG=1 logs. Stats: "%.1f drawn as
+  copy passes" in the Frame timeline line. Running direct6 (log + profiler) to confirm detection and the GPU gain.
+- 18:30 direct6 (batch 3, BB_COPY_CS_LOG=1 + profiler): MATCH_OK, no Metal errors, picture correct in the harness.
+  CopyDispatchDetectPass finds 510f1e38 ("img1 <- img0 (sampler 0), scale buffer 0 dwords 0/1, workgroup 8x8,
+  swizzle 2103"); but only 1.0 of the ~13 instances a frame ran as a pass — the other 12 declined (the 200-line
+  log was used up by the mip-chain dispatches, correctly declined as "same image"). Decline log now prints only
+  grids >= 256 groups with image ids, destination size/type/format; direct7 running for the reasons.
+- 18:55 direct9 (copies allowed between two views of one image, size from the view): MATCH_OK, picture correct
+  (open play shot checked), 4.0 copy passes a frame in every phase, no declines logged for the 240x135 grid, yet
+  the profile (direct10, run end) still shows 12 encoders a frame under the 510f1e38 label (4 of them the passes,
+  which took the dispatch's label). Heavy phase 51-57 fps at 903-927 draws, GPU busy 13.3-16.4 (direct5 13.4 at
+  887-898: not better yet). Open play p99 20-23 ms (was 26-28). Next build: passes get their own profile label and
+  a log line when a large dispatch's shader info carries no detection (the only silent path left) - direct11.
+- 19:07 direct11 (passes with their own profile label): MATCH_OK. The label "copy pass cs 510f1e38" carries 8-12
+  encoders a frame for 4.0 passes a frame: the profiler charges the encoders that follow a mark (the resumed main
+  pass after each split) to the copy's label. So the "8 ms copy dispatch" of the morning profile was mostly the
+  main pass continuing after the split, not the copy; there are 4 copies a frame, all converted now, and the GPU
+  cost that remains is the 4 attachment store/load splits the copy's read of the colour target forces (inherent).
+  Deciding the default by an A/B without the profiler: direct12 (passes on) vs direct13 (BB_COPY_CS_PASS=0).
+- 19:20 A/B (no profiler): copy passes on (direct12) mean p99 18.7 ms over 124 samples, GPU busy 8.3-9.6 ms at 330-500
+  draws, worst 25-33 (two 43s); off (direct13, BB_COPY_CS_PASS=0) mean p99 21.0, GPU 8.6-10.6 at 400-440 draws, worst
+  frames 57-62 in its heavy window. Equal or better on: copy passes stay ON by default. Final build + seed refresh
+  (harness cache merged into app/shader_seed, backup shader_seed/CUSA02138.bak_20261109) + candidate 2 package.
+- 19:26 appval_c2 (candidate 2 = final 0.5.1-c, fresh seeded cache): MATCH_OK, direct protection on, 4 copy passes a
+  frame, 2 compiles (the refreshed seed preloads 259 of 372 pipelines: 113 entries the harness flow did not touch
+  today keep the old metadata and compile on first use), no errors. Copied over the SSD candidate 1 ("FIFA 16
+  v0.5.1-c.app" + F16-macOS-0.5.1-c.zip). 0.5.1 and 0.5.1-b untouched; nothing committed.
+  Left open: the 113 stale seed entries (a content sweep would refresh them); the GPU-bound cutscenes (13.5 ms GPU
+  busy at ~890 draws: 4 inherent pass splits for the colour-target copies, the 1x1x1 dispatches 3327c37b/3ba88f63
+  that still split passes, ~1.9+0.65 ms of segments); the 100 ms phase-transition hitch seen once per match.
+
+## 2026-11-09 — 0.5.1-d round (hitch, seed, pass splits, hardening)
+
+- 19:35 The in-match 100-180 ms frames (one or two per match): the spike log shows the GAME not flipping for that long
+  (game 180 ms apart) while the host's stages are small (host->flip 2-5 ms, GPU thread 2 ms, 0-14 page faults
+  waited <1 ms), each next to [Kernel.Fs] opens of commentary/speech banks (/download0/audiodata/... missing, the
+  game then loads them from the disc). Emulator-side file loading, not the renderer: documented, not fixable here
+  (no emulator code changes in these bundles).
+- 19:36 Hardening: the game's fault handler gives up on the shared protection lock after 1 s with the host alive
+  (handles the fault without it, says so) instead of spinning on a stuck host. d1 running with BB_DEFER_CS_LOG=1
+  for the 1x1x1 dispatches' decline reasons.
+- 19:45 d1 (BB_DEFER_CS_LOG=1): MATCH_OK; the 400-line decline log was again filled at boot by grids over the cap
+  (510f1e38 "size" x365) — the in-match reasons for 3327c37b/3ba88f63 (1x1x1) did not fit. Visible: deferred
+  dispatches flushed by draws binding a 192 MiB read range (0x442a6e000+0xc000100) that covers a deferred write
+  (172 + 80 such conflicts a run). Hoist/defer decline logs now skip grids over the cap (build after dseed).
+  dseed (10-minute match) running to widen the seed.
+- 19:57 dseed (SAMPLE_SECS=600): 0 compiles over 8 minutes of match (170 fps samples, mean p99 24.7 ms) before the
+  guard's 480 s idle rule killed it (the harness writes its report late): the seed already covers everything this
+  flow reaches; the 113 stale entries are content outside it. Guard idle limit raised to 1000 s (qguard4.sh).
+- 20:04 d2 (hardened build, filtered decline logs): MATCH_OK. The 1x1x1 dispatches 3327c37b/2eaab068 are declined
+  as "no open pass" 198-199 times each: they arrive between passes and split nothing; their profile "segment" time
+  is GPU idle before them (the GPU waiting for the command stream), not a split. Deferred-dispatch flushes by
+  ordering requests: 299 a run (~0.1 a frame), negligible. No renderer lever left in the pass structure: the four
+  colour-target copies are the only splits and they are the game's design.
+- 20:05 0.5.1-d = 0.5.1-c + fault-handler lock timeout (1 s, then handle without the lock) + decline logs limited
+  to grids within the cap; same renderer defaults. Packaging app/out_perf_d, validating, then SSD.
+- 20:09 appval_d (packaged 0.5.1-d, fresh seeded cache): MATCH_OK, 0 compiles, direct protection on, no errors.
+  Copied to /Volumes/SanDiskSSD as "FIFA 16 v0.5.1-d.app" + F16-macOS-0.5.1-d.zip beside 0.5.1, 0.5.1-b, 0.5.1-c.
+  Nothing committed. What remains is outside the renderer: the game's audio-bank loads (100-180 ms frames at
+  commentary events), the per-vblank simulation (60 fps ceiling), the four colour-target copy splits, and the
+  113 seed entries for content the match flow never reaches.
+
+## 2026-11-09 — 0.5.1-e round (jagged lines: anti-aliasing)
+- 20:30 Facts: the window is the full Retina screen (3024x1834 px, density 2); the game renders 1920x1080 with 2-sample
+  MSAA (EQAA 4 coverage / 2 fragments on the PS4 — Metal has no EQAA, so edges get 2 samples where the PS4 had 4);
+  the presenter scales 1080p -> 3024x1834 with a linear sampler; FSR (EASU/RCAS, host pass) exists but is off in the
+  config; no post AA pass exists.
+- 20:52 fsr1 (config fsr_enabled, RCAS off): MATCH_OK, GPU busy unchanged (13.6 in cutscenes), mean p99 19.7: free, but
+  the zoomed crops show the same staircase on the pitch lines as bilinear — the aliasing is in the 1080p render.
+- 20:55 BB_MSAA=<n> (video_core/bb_msaa.h, applied in image_info.cpp and the pipeline key): multisampled guest targets
+  get n real samples; FIFA's EQAA resolve walks coverage samples 0-3 through the emulated FMASK, so 4 real samples
+  are true 4x. msaa4 run started (FSR off).
+- 21:00 msaa4 (BB_MSAA=4): MATCH_OK, brightness unchanged (median frame luma 0.354 vs 0.350), open play 60 fps p99 20,
+  but cutscenes 47-52 fps at GPU busy 16.5-18.9 ms (+5 ms) — and the zoomed centre-circle crop shows the SAME
+  staircase as 2x. Cause found in the FMASK emulation: FIFA's resolve decodes 2-bit fields (Fmask8_S4_F2) and the
+  constant 0x76543210 reads as coverage->fragment (0, 0, 1, 0): three of four taps take fragment 0, i.e. no
+  anti-aliasing at all since the port began (the user's jagged lines). resource_patching_pass.cpp now builds the
+  word per FMASK format: coverage sample i -> colour sample i mod N (N = fragments or BB_MSAA): 0x44 for 2
+  samples (true 2x), 0xE4 with BB_MSAA=4 (true 4x). ShaderMetaVersionBase 13 (resolve recompiles). Runs fm2/fm4.
+- 21:22 fm2c (resolve word 0x44 = (0,1,0,1), 2 samples): MATCH_OK, GPU busy unchanged, p99 20.3, luma 0.368 (+5%);
+  fm4c (BB_MSAA=4, all shaders recompiled with 4-sample image info): MATCH_OK but the scene renders BLACK (HUD only,
+  luma 0.067) — the 4x override is not viable as is (msaa4 with cached 2-sample shaders rendered fine at +5 ms GPU).
+  The fm2c crops still show hard stair-steps on the lines: the two colour samples hold the same data at edges
+  (the 10-31 note saw the same). smp0/smp1 (BB_FMASK=00 / 55: sample 0 only / sample 1 only, BB_MSAA_LOG=1)
+  queued to prove whether the samples ever differ and whether the scene target is swapped 1->2 samples by copies.
+- 21:40 smp0/smp1 (BB_FMASK=00 / 55) were invalid: 0 compiles — the FMASK word is baked into cached SPIR-V and not
+  part of any key, so both ran the cached 0x44 resolve (the 10-31 note said "with cleared shader caches" for a
+  reason). MSAALOG empty: no backing swaps and no port-side resolves during a match (the scene renders 2-sample
+  throughout and the game's resolve reads it). ShaderMetaVersion now carries a hash of BB_FMASK/BB_MSAA (bits 27-31)
+  so such runs recompile. smp0b/smp1b queued; fixed goal-kick-camera crops of the stands will show whether the two
+  colour samples differ at all (the crops of fm2c suggest they do not).
+- 21:52-22:21 smp0b/smp1b + RTFMT: the scene really is 2-sample MSAA and the resolve averages both samples (the
+  0x44 word is right); geometry edges ARE anti-aliased. The visible staircase on the pitch lines is texture
+  content inside polygons (the line markings are texels, minified/magnified with no supersampling), which MSAA never
+  touches. So: (a) the earlier claim "the FMASK fix gives visible AA on the lines" was WRONG; (b) the fix for what
+  the user sees is a post-process edge AA pass.
+- 22:21 build: edge AA pass (FXAA 3.11 luma variant) in the presenter, at 1080p before the scale to the screen:
+  vk_presenter.cpp PrepareFrame -> pp_pass.EdgeAa -> renderer_metal/mtl_present.mm (shader in mtl_blit_shaders.h).
+  Default ON. Env: BB_AA=0 off, BB_AA_SUBPIX (0.5), BB_AA_EDGE (0.125), BB_AA_EDGE_MIN (0.0312), BB_AA_SPLIT=<x
+  fraction left untouched, for side-by-side crops>, BB_SNAPSHOT_TRIGGER=<file> (touch it -> lossless PNG of the drawable).
+- Upstream survey (shadPS4 origin/main, 78 commits past our base 3eecea94): nothing with a measurable gain for FIFA.
+  Renderer: 2831b681 already equivalent here; 914e78c3 / 145932bf / 6add101d are micro-opts on paths that are not
+  our bottleneck; c6b24ec1 / 8e23388a / 1eab1796 / 99e33b7e are large Vulkan-side refactors of code this port replaced
+  with the Metal path; recompiler fixes are for other games and would force a shader-cache rebuild. Emulator side:
+  kernel / save_data / np / ajm / fs correctness fixes (87290181 sorted mounts, 16157ae6 VFS cache invalidation,
+  a5441d6f guest init thread, 8a66adab submit-every-N-draws per game): none touches FIFA's hot paths. Not merged.
+- "Convert parts of the emulator to arm64": the game's own code is x86-64 and must run under Rosetta in one process
+  with the HLE libraries it calls (no cross-architecture calls inside a process); everything that could move
+  (GPU command processing, shader recompiler, Metal recording) already runs natively in the arm64 GPU host. Open
+  play sits at the 60 fps simulation cap. No further arm64 conversion has a measurable gain.
+- 22:36 aa1 (BB_AA_SPLIT=0.5, GPU profile): lines visibly smoother on the AA half (crops/cmp3.jpg). One-off: crowd
+  rendered BLACK in this run only. ctl1 (22:43, BB_AA=0), aa2 (22:47, AA on), aa3 (22:53, AA + profiler): crowd fine
+  in all; contact sheet of 46 earlier runs: black crowd only in aa1. Not the AA pass, not the profiler.
+- AA cost, unpaired (ctl1 vs aa2): open play GPU 9.59 vs 10.20 ms at 362 / 372 draws; cutscene 13.13 vs 15.23 ms
+  (3-4 windows, noisy). The profiler cannot isolate the pass (labels are charged until the next mark).
+- 23:01 build: BB_AA_QUALITY (0 = 5 search steps, 1 = 8, 2 = 12; default 2), BB_AA_ALT=<s> (measurement aid:
+  cycles off/q0/q2 every s seconds, logs "[AA] off|q0|q2"), and ColorAttachment::discard -> MTLLoadActionDontCare
+  for the two full-screen present passes (PostProcess to the drawable, EdgeAa to its 1080p target; both overwrite
+  every pixel, Load made the GPU restore the old contents on a tile-based GPU). Run aa4 (BB_AA_ALT=15, SHAD_STUTTER=1).
+- Hitches: the 100-165 ms frames coincide with bursts of failed loose-file opens on the "FileDevice driver" thread
+  (hundreds per burst, ~50 us each = 22-34 ms per 500; FSNEG lines). About 10% of a burst; the rest is the game's
+  own loading. An emulator-side negative cache needs a full emulator rebuild (no build tree left): recommendation.
+- NEW (ctl1 Spike lines): late frames in cutscenes carry game-side GPU page-fault waits. 49 fps window at 1252
+  draws: GPU 72% busy, command thread 52% idle, each late frame 5-10 relayed faults with 6-14 ms waited. Over all
+  late frames with 250+ draws: 493 frames, mean 4.7 faults / 4.7 ms waited; 1250+ draws: 7.6 faults / 8.5 ms.
+  A relayed fault that touches an on-demand image waits for the GPU command thread to reach its command
+  (vk_rasterizer.cpp ResolveOndemandImages -> liverpool->SendCommand<true>): with 1200 draws queued that is most of a
+  frame. Run flt1 (BB_FAULT_STATS=1) to name the pages.
+- 23:01 aa4 (paired, BB_AA_ALT=15): clean open-play windows GPU busy: off ~9.0 ms, 5-step ~9.2 ms, 12-step ~9.0 ms;
+  cutscenes at 860-950 draws: off 14.1-16.6, on 15.2-17.4 (same spread). The edge AA pass costs at most ~0.2 ms,
+  inside the noise; quality level makes no measurable difference -> default stays BB_AA_QUALITY=2. Crowd fine.
+- 23:11 flt1 (BB_FAULT_STATS=1, BB_AA_SPLIT=0.5): crowd fine (aa1's black crowd stays a one-off, not the split).
+  ROOT CAUSE of the cutscene frame-rate loss: per 2 s "[WFAULT] n=660 ondemand=674.7ms download 52 (674.1ms)",
+  "[ODWC] 93x75f109DP@458f6f600x52", "[ODT] last write pending 52 | ordered wait 52 (664.6 ms)",
+  "[FAULTS] write=660 read=0 wait=701.3ms s4=52". The game writes a constant buffer 128 bytes past the end of the
+  93x75 RGBA32F on-demand image at 0x458f6f600 (111600 bytes, not droppable, below the prefetch threshold), i.e. on
+  the image's last page; the page is read-watched for the image, so the write relays and the host downloads the
+  image synchronously. The image's last write is still in the pending command buffer, so every such fault waits
+  8-13 ms for the GPU: the game thread is blocked 425-870 ms of every 2 s and the frame is serialised with the GPU
+  (GPU busy ~15.1 ms, frame span ~21.5 ms, command thread ~50% idle, 49-54 fps).
+  (The 2026-11-04 asynchronous-landing attempt was reverted on run 095554, later identified as the pre-existing
+  night-match collapse: never validly tested.)
+- 23:35 build: TAIL RELEASE (BB_ODW_TAIL=0 off). texture_cache.cpp ReleaseOndemandTails: a write fault wholly past
+  the end of a pending on-demand image, on the image's last page (image has earlier pages), lifts that one page's
+  read watcher (range trimmed, refcounts exact), snapshots the image's tail bytes in guest memory, keeps the image
+  pending and queues an asynchronous download (tail_downloads -> ProcessDownloadImages -> DownloadImageMemory
+  only_if_pending). Every asynchronous landing goes through WriteBackImage: head unconditionally, the released tail
+  only while guest memory still equals the snapshot (CPU bytes written there are kept); a landing for an image that
+  left the pending set is skipped. The next GPU write protects the tail again (QueueReadback ->
+  ReprotectOndemandTail). A write INTO the image bytes of a released tail still downloads synchronously
+  (vk_rasterizer.cpp ResolveOndemandImages: OndemandTailHit). texture_cache InvalidateMemory keeps the readback of a
+  tail-released image for writes beside it. Residual risk: a CPU read of the image's last ~1.7 rows between the
+  page-sharing write and the landing sees the previous frame's bytes (the CPU never reads this image: read=0);
+  the GPU buffer-read path's deferred landing writes the tail unconditionally.
+  Stats: [WFAULT] "tail N (ms) unresolved N", [ODTAIL] released/reprotected/landings. Run tail1.
+- 23:44 tail1: no gain ("download 60 (520 ms)", "tail 0"): the page-sharing write is on the image's FIRST page
+  (below 0x458f6f600), not the last. 23:45 build generalises the release to both edge pages (OndemandTail.edge[0/1],
+  range.first advanced for a head release; WriteBackImage guards each released edge with its snapshot).
+- 23:54 tail2 (BB_FAULT_STATS=1): "[WFAULT] ondemand=1.3ms | download 0 tail 60 (0.4ms) unresolved 0",
+  "[ODTAIL] released 60 reprotected 60 | landings: tail written ~100, kept 0, skipped 0", "[FAULTS] wait=27-37ms"
+  (was 700 ms per 2 s). First cutscene group at 860-900 draws: 59.0-59.6 fps (flt1: 50-57), command thread idle
+  52-57%. MATCH_OK. Later cutscene group (880 draws, 51-52 fps in BOTH runs, worst frame 55-65 ms) is a different
+  problem: the GAME does not submit for 45-55 ms every 12-15 frames (spike log "game 52.2!", GPU thread on CPU
+  6 ms, 10 page faults 0.6 ms waited). Not the file probes (the 600 "duplicate messages" per window are the
+  sceNpPartyCheckCallback stub on FEThread). Next: sample the emulator during such a window.
+- 2026-11-10 00:06 stall1 / 00:20 stall2 (10-minute match) / 00:31 def1 (default settings, no fault stats): all
+  MATCH_OK. The periodic game-side stall did not recur in any of them (harness/stallhelper.sh samples the emulator
+  when an [FSTAT] window has >= 3 hitches at >= 45 fps with GPU >= 11 ms): OPEN, seen only in 231132 and 234559.
+  def1: intro flyover 1220-1357 draws 58.2-59.0 fps (flt1: 49.9-51.8), goal-kick/crowd cameras 788-909 draws
+  55.8-59.8 fps at GPU 14.7-17.4 ms (now GPU-limited), open play 59.4. stall2's slow windows are purely GPU-bound
+  (GPU busy 19-23 ms, p50 20 ms, 0 hitches, 44-50 fps). Cutscene snapshots (crops/def1_sheet.jpg) correct.
+  The three game gaps over 70 ms in def1 are all in the pre-kick-off asset load (kit/face/shoe opens), none in play:
+  no evidence that an emulator-side negative cache for failed opens would gain anything measurable.
+- 00:32 0.5.1-e packaged (app/out_perf_e, F16-macOS-0.5.1-e.zip 97 MB): build_e.sh x86 + make_perf_app.sh 0.5.1-e.
+- 00:38 appval_e (packaged app out_perf_e, fresh seeded cache, run app/work26/data_test/runs/20261110_003325):
+  MATCH_OK, seed 1709 files in 337 ms, direct page protection on, no errors. 575 pipeline builds from the seed over
+  the whole run = 198 ms in total (0.34 ms each, cache loads). Open play 59-60 fps, 1 hitch in 20 windows;
+  intro flyover 1356-1408 draws 57.8-58.9 fps, 845-863 draws 58.9-59.4 fps (GPU 14.6-14.8 ms).
+- 00:39 copied to the SSD: "FIFA 16 v0.5.1-e.app" (ditto, codesign verify ok) + F16-macOS-0.5.1-e.zip (cmp identical);
+  the four earlier bundles there still verify.
+- Periodic stall, log analysis of 234559: stalls every 12-15 frames (46-59 ms game gap), only at 880-899 draws with
+  flip_rate 1, fast cadence; host stages small in the stalled frame (host->flip 7.5 ms, queued 0, acquire 0).
+  NOT a GPU threshold: other runs hold 59-60 fps with 0 hitches at GPU busy 15.2-16.2 ms. NOT the pacing's slow
+  path (slow cadence completes at once). So it is something the game does in one scene type. 00:42 chainstall.sh:
+  up to three more sampled runs (stall3-5) to catch it with `sample`.
+- 00:58 stall3 (004136): MATCH_OK, no pattern window. stall4 (005009): MATCH_OK, ONE pattern window caught and
+  sampled (results/stall4.sample1.txt, 555 samples in 4 s; the sampling itself froze the next three windows).
+  Scene = the goal-kick wait camera (keeper with the ball, crowd stand behind, 876-899 draws, flip_rate 1); the
+  harness never takes the kick, so the game sits in it for 12-16 s. Sample (harness/sample_leaves.py): Game:Main
+  78% in game code + 11% sched-yield inside a job-wait loop (0x4024ccfb5 -> 0x400305b90 -> 0x400308c0e runs jobs
+  while waiting), 90_job0..3 77-85% running jobs, the submit thread 62% game code + 7% ring push. No emulator
+  wait, no file access, no fault wait. => in this scene the game itself uses ~5 cores of Rosetta-translated CPU;
+  with the host's command/recording threads the six performance cores are saturated, and the stall is the game's
+  own job chain running late (most likely a thread spilling to an efficiency core). Intermittent per run: tail2
+  stalled in every goal-kick scene from its start, def1 / stall1-3 / appval_e never, stall4 one window.
+  Nothing left to fix on the renderer side. Possible follow-up (needs an emulator rebuild + a quiet-machine A/B
+  of >= 8 runs per arm): guest threads at user-interactive QoS, host helper threads at utility QoS.
+- The pre-test shader cache of the app fixture is kept in app/work26/cache_aside_20261110/ (the fixture now holds
+  the freshly seeded one).
+
+## 2026-11-10 — 0.5.1-f round ("any hitch bothers me", jagged lines still visible)
+
+Result: app/out_perf_f (F16-macOS-0.5.1-f.zip 97 MB, SSD "FIFA 16 v0.5.1-f.app"), renderer build f16 + emulator
+rebuilt from shadps4-metal (9 files uncommitted). Earlier bundles untouched. Nothing committed.
+
+- Jagged pitch lines, root cause: NOT missing anti-aliasing. The renderer forces 16x anisotropy on every sampler; the
+  pitch shader (ps ed446cb3) reads its line texture through a sampler with a +2 LOD bias as a "line near this pixel"
+  mask guarding its own 3x3 supersampling. Anisotropy takes the mip from the minor axis, so at the grazing angle the
+  mask no longer reached the pixels beside the line and they skipped the supersampling. Fix: no forced anisotropy on
+  samplers with a positive LOD bias (vk_rasterizer.cpp; BB_ANISO_BIASED=1 restores). Verified on snapshots
+  (harness/linemetric.py). The 0.5.1-e note "FXAA smooths the pitch lines" was wrong; FXAA stays for other edges.
+- Late flips: std::this_thread::yield() is swtch_pri() on macOS (caller depressed to the lowest priority for up to a
+  10 ms quantum). bbport::Yield in the renderer and a guest yield in the emulator (SHAD_GUEST_YIELD=legacy restores).
+- Game process priority: with the split renderer the emulator has no window, so App Nap clamped every thread to
+  utility priority 20 (ps -M). main.cpp KeepProcessInteractive (NSActivityUserInitiated | LatencyCritical;
+  SHAD_APP_NAP=1 restores). Guest threads at user-interactive QoS (SHAD_GUEST_QOS=ui|in|off).
+- Display cadence. ProMotion in adaptive mode shows frames on 4.17 ms quanta with jitter; a 1x1 pt "heartbeat"
+  sublayer recoloured every ~7 ms pins the display to a steady 120 Hz grid (mtl_present.mm StartSteadyRefresh;
+  BB_REFRESH_BEAT=0 off; BB_DISPLAY_60=1 switches the display to its 60 Hz mode instead). Paced presents (minimum
+  duration 0.97/60 s) keep each frame for two refreshes. Display-path floor: a finished frame needs 21-24 ms from GPU
+  end to shown on the 120 Hz grid (28 ms at 60 Hz); a full 3-drawable queue is 48 ms wait, 78-88 ms flip to screen.
+- Pacing lock (vk_presenter.cpp PacingLock): slews the present thread's 60 Hz tick (BbPacing::TickSlewNs, at most
+  +0.2 / -0.1 ms per frame) so the least wait of the last 8 on-time frames sits at 40 ms: one spare frame hides a
+  single late game frame, flip to screen 53 ms instead of 78-88. Target 26 ms (and 12 at 60 Hz) sits on the floor and
+  misses on ordinary jitter (r2: 97.6% even). Raising the target on misses was tried and removed (it only chased
+  capture artifacts to 45-46 ms = 68 ms latency). Flip completion credit kept (BB_FLIP_CREDIT=0: 95.9% even).
+  bbport.ini even_frames (default on; overlay "Even frame times"); off = unpaced, 34 ms, 84% even frames.
+- MEASUREMENT ARTIFACT: the "spontaneous lone 25 ms display skips" (0.5-1.4/s, clusters every ~3.3 s) were the
+  harness. Every `screencapture` makes the window server skip a refresh (probe pacetest: captures every 2.5 s skip,
+  8 threads of CPU load do not). All earlier display-late numbers taken with captures are inflated. Method now:
+  QUIET_SECS=45 (fifa_autotest2.sh sleeps without captures once in the match) + harness/quietsum.py.
+- Capture-free numbers, in match (even = frames shown 16.7 ms after the previous one):
+  heartbeat + paced + lock 40 (default): 100.0% even, 0 late/s, 53 ms flip to screen (r1, q_b; v1 30 s of open play
+  with 0 late frames); paced without lock 99.9% at 78 ms; unpaced 83.7% at 34 ms; 60 Hz mode without lock 99.8% at
+  87 ms, with lock 99.9% at 54-60 ms.
+- What is left and why: (1) GPU-bound cutscenes at 52-56 fps (590+ draws, GPU 16+ ms) show a 16.7/25 ms mix, inherent
+  below 60 fps on a fixed grid; (2) game stalls of 40-60 ms about once per 40 s in a match, nearly all in frames that
+  register new images (camera cuts, replays): the lock's spare frame turns them into one 25 ms frame; (3) menu and
+  pre-kick-off asset loads (stalls over 70 ms: 108 of 118 in run v1 are outside play).
+- 07:43 appval_f (packaged app, run app/work26/data_test/runs/20261110_073826): MATCH_OK, 0 critical lines, direct
+  page protection, heartbeat on, lock target 40. 07:46 copied to the SSD (ditto; zip cmp identical; all six bundles
+  verify; emulator keeps get-task-allow). make_perf_app.sh takes EMU_BIN=<built shadps4> since this round.
+- Not done: stadium-edge aliasing, GPU cost of the sampler fix (not measurable in GPU busy), the goal-kick stall A/B
+  for the QoS changes (>= 8 runs per arm).
+
+## 2026-11-10 — 0.5.1-g and 0.5.1-h rounds (short record; details in CHANGES-FIFA.md of the two forks)
+
+- 0.5.1-g: texture fixes (dark bodies, blue face, wrong mip level 0: FindImage lost the mip view), flip-based
+  pacing lock, opt-in 120 Hz mode in the launcher, start-up patch cache in the emulator (64 s to 16 s).
+- 0.5.1-h: one-time draws skipped on a cold pipeline cache (yellow menu players): steady-target rule. FIP balls
+  served unmodified.
+- Both still carried Resources/shader_seed (and -g/-h Resources/patch_seed): made from the game, so 0.5.1 to
+  0.5.1-h are not publishable bundles.
+
+## 2026-11-10 — 0.5.1-i round (nothing game-derived in the app, caches in the savegame folder, publishable)
+
+- Bundle: no shader_seed, no patch_seed. run.sh `place_caches` links `<data>/user/cache` to `<saves>/cache`
+  (shader cache `CUSA02138/`, patch record `static_patches/*.spc`), moving an older cache there. The seed
+  variables are unset. make_perf_app.sh removes both seed folders, fails on any cache or game file in the bundle,
+  replaces the build machine's home folder in the binaries (scrub_build_paths.py, 3386 strings in 17 files) and
+  writes an honest SOURCES.txt: "LOCAL BUILD" while a repository has uncommitted changes; RELEASE=1 refuses to
+  package unless all four are clean and tagged v<version>.
+- First launch: the emulator writes `prepare <0..1000>` to BB_PROGRESS_FILE while it patches the game code
+  uncached; the GPU host shows a bar in the game window, the launcher shows "First launch: preparing the game N%".
+  While pipelines compile the overlay shows a "Building shaders" note (BB_SHADER_PROGRESS=0 turns it off).
+- Root cause of the slow full-screen start: macOS Game Mode. The GPU host is the full-screen game
+  (LSApplicationCategoryType games), so Game Mode demoted the emulator process, which runs the game itself, to the
+  background role (all threads at priority 4) from about 2 s after its start until it first played sound.
+  A process with a running audio output is exempt: the emulator now keeps a silent AudioToolbox output queue
+  (main.cpp KeepAudioActive, SHAD_BOOT_AUDIO=0 turns it off). Full screen, new user: first picture 57-60 s -> 14 s,
+  code preparation 46-55 s -> 7.2 s; second start 16 s -> 7 s. Game Mode stays on for the host.
+  Checked and rejected: LSSupportsGameMode=NO on the host (works, but loses Game Mode), SDL background app flag
+  (still demoted), App Nap opt-out (no effect).
+- Launcher: "Cache: <size>" and "Clear Cache…" beside the savegame folder (CacheStore), the preparing row, a stale
+  refresh no longer reports "The game exited." for a running game, the "Other emulator running" note is hidden
+  while starting. 128 checks pass. SwiftUI @State does not compile with this command-line toolchain (macro plugin
+  missing): view flags are @Published on the model.
+- Validation of the final bundle (app/out_perf_i): packaged-app match check MATCH_OK twice (59.5 and 59.9 fps,
+  p99 23.5 and 21.8 ms, GPU 9.1 and 9.7 ms; before the change 59.9 / 22.7 / 9.2), every binary's signature valid,
+  emulator keeps get-task-allow.
+- Audit for publication: see the 0.5.1-i hand-over. Not committed, not tagged, not pushed.
+
+## 2026-11-10 — v0.5.1 release (the 0.5.1-i round, tagged)
+
+- The last development round, 0.5.1-i, is the release v0.5.1. The interim bundles 0.5.1 to 0.5.1-i are deleted:
+  0.5.1 to 0.5.1-h carried the translated shader cache and must never be published.
+- Found while preparing the release: the 0.5.1-i bundle carried an x86 libbbgpu (the game-side library) built
+  before the last source changes, because only the arm64 side had been rebuilt. Rebuilt (41 objects), and
+  `RELEASE=1` now refuses to package while a build directory is not up to date (make_perf_app.sh).
+- The release is packaged from the v0.5.0 bundle (app/out_host26) as base:
+  `RELEASE=1 EMU_BIN=<shadps4> LAUNCHER_BIN=<F16> make_perf_app.sh 0.5.1` -> app/out_perf. It differs from the
+  0.5.1-i bundle only in the x86 libbbgpu, Info.plist, SOURCES.txt and the signatures.
+- Validation of the release candidate (same binaries, before the commits): packaged-app match check MATCH_OK,
+  17 windows, 59.9 fps, p99 21.5 ms, max 36.7 ms, 0 hitches, GPU 11.1 ms; first launch in full screen with no
+  cache: preparation 8 s, first picture 14 s, caches created in <savegame folder>/cache.
+- Publication hygiene: local tags and one branch whose commits carried a personal email or the machine name
+  were removed from the renderer, emulator and mods repositories (none was ever pushed). Four old scripts in
+  home/ take their scratch folder from FIFA_SCRATCH.
+- To publish: push each branch and the tag v0.5.1 by name to the fork remotes, then upload F16-macOS-0.5.1.zip.

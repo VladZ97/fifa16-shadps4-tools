@@ -68,10 +68,62 @@ echo "run dir : $dir"
 """
 write(stubScript, paths.runScript, executable: true)
 
+// MARK: Clear cache
+do {
+    let fm = FileManager.default
+    var cs = LauncherSettings()
+    cs.savesDir = scratch.appendingPathComponent("clear saves").path
+    let f = GameFolders(settings: cs, paths: paths)
+    let save = f.saves.appendingPathComponent("CUSA02138/SAVE0001/data.bin")
+    write("savegame", save)
+    check(CacheStore.usage(folders: f, paths: paths).files == 0, "no cache yet")
+    check(CacheStore.clear(folders: f, paths: paths).files == 0, "clearing nothing is harmless")
+    write("12345", f.shaderCache.appendingPathComponent("0x01_0.spv"))
+    write("123", f.shaderCache.appendingPathComponent("metal/a.metal"))
+    write("1234567", f.saves.appendingPathComponent("cache/static_patches/eboot.spc"))
+    // A cache of an older version, still in the data folder.
+    let oldRoot = paths.shaderCache.deletingLastPathComponent()
+    let oldExisted = fm.fileExists(atPath: oldRoot.path)
+    write("12", paths.shaderCache.appendingPathComponent("old.spv"))
+    let before = CacheStore.usage(folders: f, paths: paths)
+    check(before.files == 4 && before.bytes == 17, "cache usage counts both places (\(before.files) files, \(before.bytes) bytes)")
+    let removed = CacheStore.clear(folders: f, paths: paths)
+    check(removed == before, "clear reports what it removed")
+    check(CacheStore.usage(folders: f, paths: paths).files == 0, "cache empty after clearing")
+    check(fm.fileExists(atPath: f.saves.appendingPathComponent("cache").path), "the cache folder itself stays")
+    check((try? String(contentsOf: save)) == "savegame", "savegames are not touched")
+    // The emulator's folder as a link to the savegame folder (0.5.1-i): counted once, the link stays.
+    try? fm.removeItem(at: oldRoot)
+    try? fm.createSymbolicLink(at: oldRoot, withDestinationURL: f.saves.appendingPathComponent("cache"))
+    write("12345", f.shaderCache.appendingPathComponent("0x02_0.spv"))
+    check(CacheStore.usage(folders: f, paths: paths).files == 1, "a linked cache is counted once")
+    CacheStore.clear(folders: f, paths: paths)
+    check(CacheStore.usage(folders: f, paths: paths).files == 0, "linked cache cleared")
+    check((try? fm.destinationOfSymbolicLink(atPath: oldRoot.path)) != nil, "the link stays")
+    try? fm.removeItem(at: oldRoot)
+    if oldExisted { try? fm.createDirectory(at: oldRoot, withIntermediateDirectories: true) }
+}
+
+// MARK: First-launch progress
+do {
+    let file = scratch.appendingPathComponent("progress")
+    check(LaunchProgress.read(file) == nil, "no progress file: nothing to show")
+    write("prepare 437\n", file)
+    check(LaunchProgress.read(file) == 437, "progress read")
+    write("prepare 1000\n", file)
+    check(LaunchProgress.read(file) == nil, "finished preparation is not shown")
+    write("garbage", file)
+    check(LaunchProgress.read(file) == nil, "anything else is ignored")
+}
+
 // MARK: Paths
 do {
     check(paths.config.path == dataDir.path + "/user/config.json", "config under the data folder's user dir")
-    check(paths.shaderCache.path.hasSuffix("/user/cache/CUSA02138"), "shader cache path")
+    check(paths.shaderCache.path.hasSuffix("/user/cache/CUSA02138"), "shader cache path the emulator uses")
+    var cs = LauncherSettings()
+    check(GameFolders(settings: cs, paths: paths).shaderCache.path == dataDir.path + "/saves/cache/CUSA02138", "shader cache with the default saves")
+    cs.savesDir = "/Volumes/Disk/my saves"
+    check(GameFolders(settings: cs, paths: paths).shaderCache.path == "/Volumes/Disk/my saves/cache/CUSA02138", "shader cache follows the chosen saves folder")
     check(paths.defaultSaves.path == dataDir.path + "/saves", "default saves folder")
     check(paths.hostBundle.path == bundle.path + "/Contents/Helpers/F16 GPU.app", "host bundle inside the app")
     check(paths.latestRun() == nil, "no runs yet")
@@ -84,16 +136,16 @@ do {
 do {
     let d = LauncherSettings()
     check(d.gameDir == "" && d.updateDir == "" && d.modsDir == "" && d.savesDir == "", "folders default empty")
-    check(d.fullscreen && !d.lowLatency && !d.frameStats && !d.metalHUD && d.mode == .play, "option defaults")
+    check(d.fullscreen && !d.lowLatency && !d.refresh120 && !d.frameStats && !d.metalHUD && d.mode == .play, "option defaults")
     check(d.overrides.isEmpty, "defaults add no variables")
     var s = LauncherSettings()
     s.gameDir = gameDir.path; s.updateDir = updateDir.path; s.modsDir = modsDir.path; s.savesDir = scratch.path + "/saves"
-    s.fullscreen = false; s.lowLatency = true; s.frameStats = true; s.metalHUD = true; s.mode = .start
+    s.fullscreen = false; s.lowLatency = true; s.refresh120 = true; s.frameStats = true; s.metalHUD = true; s.mode = .start
     let file = dataDir.appendingPathComponent("settings.json")
     try? s.save(to: file)
     check(LauncherSettings.load(from: file) == s, "settings round trip")
     let json = (try? String(contentsOf: file, encoding: .utf8)) ?? ""
-    for key in ["gameDir", "updateDir", "modsDir", "savesDir", "fullscreen", "lowLatency", "frameStats", "metalHUD", "mode"] {
+    for key in ["gameDir", "updateDir", "modsDir", "savesDir", "fullscreen", "lowLatency", "refresh120", "frameStats", "metalHUD", "mode"] {
         check(json.contains("\"\(key)\""), "settings.json has \(key)")
     }
     write("{\"gameDir\": \"/x\"}", file)
@@ -105,8 +157,8 @@ do {
     try? fm.removeItem(at: file)
 
     var t = LauncherSettings()
-    try? t.set("gameDir", "/g"); try? t.set("fullscreen", "0"); try? t.set("lowLatency", "true"); try? t.set("mode", "start"); try? t.set("updateDir", "")
-    check(t.gameDir == "/g" && !t.fullscreen && t.lowLatency && t.mode == .start && t.updateDir == "", "--cli set values")
+    try? t.set("gameDir", "/g"); try? t.set("fullscreen", "0"); try? t.set("lowLatency", "true"); try? t.set("refresh120", "on"); try? t.set("mode", "start"); try? t.set("updateDir", "")
+    check(t.gameDir == "/g" && !t.fullscreen && t.lowLatency && t.refresh120 && t.mode == .start && t.updateDir == "", "--cli set values")
     check((try? t.set("mode", "nope")) == nil, "set rejects a bad mode")
     check((try? t.set("colour", "x")) == nil, "set rejects an unknown key")
     check((try? t.set("metalHUD", "maybe")) == nil, "set rejects a bad boolean")
@@ -158,11 +210,17 @@ do {
     items = InstallStatus.check(paths, settings: s)
     check(item("Savegame folder")?.ok == false && item("Savegame folder")?.optional == false, "an uncreatable saves folder blocks Play")
     write("", paths.config)
-    write("", paths.shaderCache.appendingPathComponent("a.bin"))
-    write("", paths.shaderCache.appendingPathComponent("b.bin"))
     s.savesDir = ""
     items = InstallStatus.check(paths, settings: s)
-    check(item("Emulator config")?.ok == true && item("Shader cache")?.detail == "2 files", "config and cache counted")
+    check(item("Shader cache")?.ok == false && item("Shader cache")?.optional == true, "an empty shader cache is not a problem")
+    write("", paths.shaderCache.appendingPathComponent("a.bin"))
+    write("", paths.shaderCache.appendingPathComponent("b.bin"))
+    items = InstallStatus.check(paths, settings: s)
+    check(item("Emulator config")?.ok == true && item("Shader cache")?.detail == "2 files, in the savegame folder", "config and an older version's cache counted")
+    let inSaves = GameFolders(settings: s, paths: paths).shaderCache
+    for n in ["a.bin", "b.bin", "c.bin", ".hidden"] { write("", inSaves.appendingPathComponent(n)) }
+    items = InstallStatus.check(paths, settings: s)
+    check(item("Shader cache")?.detail == "3 files, in the savegame folder", "the cache in the savegame folder counted")
 }
 
 // MARK: The environment Play passes (golden)
@@ -187,15 +245,15 @@ do {
     ]
     check(env == golden, "default settings: folders only, inherited BB_* removed, stale FIFA_* replaced: \(env)")
     s.updateDir = "/games/CUSA02138-UPDATE"; s.modsDir = "~/mods"; s.savesDir = "/saves"
-    s.fullscreen = false; s.lowLatency = true; s.frameStats = true; s.metalHUD = true
+    s.fullscreen = false; s.lowLatency = true; s.refresh120 = true; s.frameStats = true; s.metalHUD = true
     env = s.launchEnvironment(base: base, paths: paths)
     var golden2 = golden
     golden2["FIFA_UPDATE_DIR"] = "/games/CUSA02138-UPDATE"
     golden2["FIFA_MODS_DIR"] = "" // a folder for mods, not built yet: nothing to hand to the game
     golden2["FIFA_SAVES_DIR"] = "/saves"
-    golden2["BB_FULLSCREEN"] = "0"; golden2["BB_PRESENT_MODE"] = "Immediate"; golden2["BB_FRAME_STATS"] = "1"; golden2["MTL_HUD_ENABLED"] = "1"
+    golden2["BB_FULLSCREEN"] = "0"; golden2["BB_PRESENT_MODE"] = "Immediate"; golden2["BB_VBLANK_HZ"] = "120"; golden2["BB_FRAME_STATS"] = "1"; golden2["MTL_HUD_ENABLED"] = "1"
     check(env == golden2, "every option and folder: \(env)")
-    check(s.overrides == ["BB_FULLSCREEN": "0", "BB_PRESENT_MODE": "Immediate", "BB_FRAME_STATS": "1", "MTL_HUD_ENABLED": "1"], "overrides")
+    check(s.overrides == ["BB_FULLSCREEN": "0", "BB_PRESENT_MODE": "Immediate", "BB_VBLANK_HZ": "120", "BB_FRAME_STATS": "1", "MTL_HUD_ENABLED": "1"], "overrides")
     check(GameControl.command(script: paths.runScript, mode: .start) == ["/bin/bash", paths.runScript.path, "start"], "command line")
     check(GameControl.runDirectory(inOutput: "x\nrun dir : /tmp/r1 \nmore") == URL(fileURLWithPath: "/tmp/r1"), "run dir parsed")
     check(GameControl.runDirectory(inOutput: "nothing") == nil, "no run dir")
@@ -370,7 +428,7 @@ do {
         for (k, v) in env where !["_", "PWD", "OLDPWD", "SHLVL"].contains(k) {
             check(got[k] == v, "run.sh received \(k)=\(v) (got \(got[k] ?? "nil"))")
         }
-        check(got["BB_FULLSCREEN"] == nil && got["BB_PRESENT_MODE"] == nil && got["MTL_HUD_ENABLED"] == nil, "defaults add no option variables")
+        check(got["BB_FULLSCREEN"] == nil && got["BB_PRESENT_MODE"] == nil && got["BB_VBLANK_HZ"] == nil && got["MTL_HUD_ENABLED"] == nil, "defaults add no option variables")
         check(got["FIFA_UPDATE_DIR"] == "" && got["FIFA_MODS_DIR"] == patchDir.path, "empty update, chosen patch folder")
     }
     if let pid = r.pid {

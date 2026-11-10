@@ -56,6 +56,8 @@ struct Paths: Equatable {
     /// shadPS4's user folder for this app (run.sh points the emulator at it).
     var user: URL { dataDir.appendingPathComponent("user") }
     var config: URL { user.appendingPathComponent("config.json") }
+    /// Where the emulator looks for the shader cache: since 0.5.1-i a link into the savegame folder
+    /// (GameFolders.shaderCache); a real folder only until the first Play of that version.
     var shaderCache: URL { user.appendingPathComponent("cache/\(Self.titleID)") }
     var runs: URL { dataDir.appendingPathComponent("runs") }
     /// The mod library of this app: registry, merged tree and, unless another folder is chosen, the mods.
@@ -90,6 +92,10 @@ struct GameFolders: Equatable {
         mods = url(settings.modsDir)
         saves = url(settings.savesDir) ?? paths.defaultSaves
     }
+
+    /// The shader cache the game builds while it runs: kept with the savegames (run.sh links the
+    /// emulator's <data>/user/cache to <saves>/cache). Nothing of it ships with the app.
+    var shaderCache: URL { saves.appendingPathComponent("cache/\(Paths.titleID)") }
 
     var eboot: URL? { game?.appendingPathComponent("eboot.bin") }
     var paramSFO: URL? { game?.appendingPathComponent("sce_sys/param.sfo") }

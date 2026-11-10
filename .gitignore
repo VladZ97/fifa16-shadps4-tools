@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 .DS_Store
+# launcher build outputs
+metal/launcher/F16.app/
+metal/launcher/out/

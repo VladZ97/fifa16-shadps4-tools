@@ -66,6 +66,10 @@ struct LauncherView: View {
                         .help("BB_PRESENT_MODE=Immediate")
                     Text("Measured: flip-to-screen 18 to 22 ms instead of 25 to 29 ms, but on a non-ProMotion display it can tear, which is why it is opt-in.")
                         .font(.caption).foregroundStyle(.secondary)
+                    Toggle("120 Hz mode (experimental)", isOn: $model.settings.refresh120)
+                        .help("BB_VBLANK_HZ=120")
+                    Text("Measured in full screen on a 120 Hz MacBook display: about 105 frames a second in matches instead of 60, and about 31 ms from the game's frame to the screen instead of about 50. Frame times are less even than at 60, because the game cannot hold 120 all the time. On a 60 Hz display the setting is ignored. Off by default.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
                 Section("Diagnostics") {
                     Toggle("Frame stats in the log", isOn: $model.settings.frameStats)
@@ -114,7 +118,8 @@ struct LauncherView: View {
 
     private var bottomBar: some View {
         HStack(spacing: 12) {
-            if !model.others.isEmpty {
+            // Not while starting: the game being started is not registered yet and would be listed.
+            if !model.others.isEmpty && model.phase != .starting {
                 Label("Other emulator running: pid \(model.others.map { String($0.pid) }.joined(separator: ", "))",
                       systemImage: "exclamationmark.triangle")
                     .foregroundStyle(.orange).lineLimit(1)
@@ -136,8 +141,14 @@ struct LauncherView: View {
                 Text("Starting…").foregroundStyle(.secondary)
                 Button(action: {}) { Text("Play").frame(minWidth: 90) }.controlSize(.large).disabled(true)
             case .running, .stopping:
-                Text(model.phase == .stopping ? "Stopping…" : "Game running (pid \(model.game.map { String($0.pid) } ?? "?"))")
-                    .foregroundStyle(.secondary)
+                if let preparing = model.preparing, model.phase == .running {
+                    ProgressView(value: Double(preparing), total: 1000).frame(width: 110)
+                        .help("Only on the first launch: the game's code is prepared once. The game window shows the same bar.")
+                    Text("First launch: preparing the game \(preparing / 10)%").foregroundStyle(.secondary)
+                } else {
+                    Text(model.phase == .stopping ? "Stopping…" : "Game running (pid \(model.game.map { String($0.pid) } ?? "?"))")
+                        .foregroundStyle(.secondary)
+                }
                 Button(action: { model.stop() }) { Label("Stop", systemImage: "stop.fill").frame(minWidth: 90) }
                     .controlSize(.large)
                     .disabled(model.phase == .stopping)
@@ -204,6 +215,19 @@ private struct FolderRow: View {
             }
             if folder.clearable && model.folderIsSet(folder) {
                 Button("Clear") { model.clearFolder(folder) }
+            }
+            if folder == .saves {
+                Text(model.cacheSizeLabel).font(.caption).foregroundStyle(.secondary).monospacedDigit()
+                    .help("The shader cache and the prepared game code in this folder: \(model.cacheUsage.files) files.")
+                Button("Clear Cache…") { model.confirmClearCache = true }
+                    .disabled(!model.canClearCache)
+                    .help(model.clearCacheHelp)
+                    .alert("Clear the cache?", isPresented: $model.confirmClearCache) {
+                        Button("Clear Cache", role: .destructive) { model.clearCache() }
+                        Button("Cancel", role: .cancel) {}
+                    } message: {
+                        Text("Removes the shader cache and the prepared game code (\(model.cacheUsage.files) files, \(model.cacheUsage.megabytes)). Savegames are not touched. The next launch prepares the game again and shaders are rebuilt while you play.")
+                    }
             }
             Button("Choose…") { model.chooseFolder(folder) }.help(folder.hint)
         }

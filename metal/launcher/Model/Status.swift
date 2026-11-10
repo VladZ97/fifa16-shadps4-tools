@@ -48,8 +48,9 @@ enum InstallStatus {
                                 optional: true, bundled: true))
         let config = exists(paths.config)
         items.append(StatusItem(title: "Emulator config", detail: config ? paths.config.path : "created on first Play", ok: config, optional: true, bundled: true))
-        let cacheFiles = (try? fm.contentsOfDirectory(atPath: paths.shaderCache.path))?.filter { !$0.hasPrefix(".") }.count ?? 0
-        items.append(StatusItem(title: "Shader cache", detail: cacheFiles > 0 ? "\(cacheFiles) files" : "empty, first sessions compile shaders",
+        func blobs(_ dir: URL) -> Int { (try? fm.contentsOfDirectory(atPath: dir.path))?.filter { !$0.hasPrefix(".") }.count ?? 0 }
+        let cacheFiles = max(blobs(f.shaderCache), blobs(paths.shaderCache))
+        items.append(StatusItem(title: "Shader cache", detail: cacheFiles > 0 ? "\(cacheFiles) files, in the savegame folder" : "empty: built from your game while you play, kept in the savegame folder",
                                 ok: cacheFiles > 0, optional: true, bundled: true))
         return items
     }
@@ -84,6 +85,64 @@ enum InstallStatus {
 
     /// Play needs every non-optional item.
     static func problems(_ items: [StatusItem]) -> [StatusItem] { items.filter { !$0.ok && !$0.optional } }
+}
+
+/// What the game builds while it runs: the shader cache and the prepared game code, in
+/// `<savegame folder>/cache` (and, left by versions before 0.5.1-i, in the data folder until the
+/// next Play moves it). Clearing removes what is inside; the folders, the link and the savegames stay.
+enum CacheStore {
+    struct Usage: Equatable {
+        var files = 0
+        var bytes: Int64 = 0
+        var megabytes: String { String(format: bytes < 10_000_000 ? "%.1f MB" : "%.0f MB", Double(bytes) / 1_000_000) }
+    }
+
+    static func roots(folders: GameFolders, paths: Paths) -> [URL] {
+        var roots = [folders.saves.appendingPathComponent("cache")]
+        let old = paths.shaderCache.deletingLastPathComponent()
+        let type = (try? FileManager.default.attributesOfItem(atPath: old.path))?[.type] as? FileAttributeType
+        if type == .typeDirectory, old.standardizedFileURL != roots[0].standardizedFileURL { roots.append(old) }
+        return roots
+    }
+
+    static func usage(folders: GameFolders, paths: Paths) -> Usage {
+        var usage = Usage()
+        for root in roots(folders: folders, paths: paths) {
+            guard let walk = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey]) else { continue }
+            for case let file as URL in walk {
+                guard let values = try? file.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]), values.isRegularFile == true else { continue }
+                usage.files += 1
+                usage.bytes += Int64(values.fileSize ?? 0)
+            }
+        }
+        return usage
+    }
+
+    /// Removes everything inside the cache folders. Returns what was there.
+    @discardableResult
+    static func clear(folders: GameFolders, paths: Paths) -> Usage {
+        let before = usage(folders: folders, paths: paths)
+        let fm = FileManager.default
+        for root in roots(folders: folders, paths: paths) {
+            for entry in (try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? [] {
+                try? fm.removeItem(at: entry)
+            }
+        }
+        return before
+    }
+}
+
+/// The first launch's preparation, as the emulator reports it in <run dir>/progress
+/// ("prepare <0..1000>", run.sh BB_PROGRESS_FILE): without its caches the emulator works through
+/// the game's code for most of a minute before the game draws. Later launches never write it.
+enum LaunchProgress {
+    /// 0..<1000 while the preparation runs; nil before it, after it and on a cached start.
+    static func read(_ url: URL) -> Int? {
+        guard let data = try? Data(contentsOf: url), data.count < 64 else { return nil }
+        let words = String(decoding: data, as: UTF8.self).split(whereSeparator: { $0 == " " || $0 == "\n" })
+        guard words.count == 2, words[0] == "prepare", let value = Int(words[1]), (0..<1000).contains(value) else { return nil }
+        return value
+    }
 }
 
 enum LogTail {

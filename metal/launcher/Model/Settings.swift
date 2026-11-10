@@ -32,16 +32,18 @@ struct LauncherSettings: Codable, Equatable {
     var metalHUD = false
     /// BB_PRESENT_MODE=Immediate: present without display sync (lower latency, can tear; unset by default).
     var lowLatency = false
+    /// BB_VBLANK_HZ=120: the game's display tick at 120 Hz instead of 60 (off by default).
+    var refresh120 = false
     /// run.sh's mode argument.
     var mode = RunMode.play
 
     /// The option variables the settings own: removed from the inherited environment, then set
     /// when the setting differs from run.sh's default.
-    static let ownedKeys = ["BB_FULLSCREEN", "BB_FRAME_STATS", "MTL_HUD_ENABLED", "BB_PRESENT_MODE"]
+    static let ownedKeys = ["BB_FULLSCREEN", "BB_FRAME_STATS", "MTL_HUD_ENABLED", "BB_PRESENT_MODE", "BB_VBLANK_HZ"]
     /// The folder variables, always set (empty when unset) so run.sh never sees a stale value.
     static let folderKeys = ["FIFA_APP", "FIFA_DATA_DIR", "FIFA_GAME_DIR", "FIFA_UPDATE_DIR", "FIFA_MODS_DIR", "FIFA_SAVES_DIR"]
     /// The keys `--cli set` accepts.
-    static let settableKeys = ["gameDir", "updateDir", "modsDir", "modsEnabled", "savesDir", "fullscreen", "lowLatency", "frameStats", "metalHUD", "mode"]
+    static let settableKeys = ["gameDir", "updateDir", "modsDir", "modsEnabled", "savesDir", "fullscreen", "lowLatency", "refresh120", "frameStats", "metalHUD", "mode"]
 
     init() {}
 
@@ -57,6 +59,7 @@ struct LauncherSettings: Codable, Equatable {
         frameStats = try c.decodeIfPresent(Bool.self, forKey: .frameStats) ?? false
         metalHUD = try c.decodeIfPresent(Bool.self, forKey: .metalHUD) ?? false
         lowLatency = try c.decodeIfPresent(Bool.self, forKey: .lowLatency) ?? false
+        refresh120 = try c.decodeIfPresent(Bool.self, forKey: .refresh120) ?? false
         mode = (try? c.decodeIfPresent(RunMode.self, forKey: .mode)) ?? .play
     }
 
@@ -67,6 +70,7 @@ struct LauncherSettings: Codable, Equatable {
         if frameStats { env["BB_FRAME_STATS"] = "1" }
         if metalHUD { env["MTL_HUD_ENABLED"] = "1" }
         if lowLatency { env["BB_PRESENT_MODE"] = "Immediate" }
+        if refresh120 { env["BB_VBLANK_HZ"] = "120" }
         return env
     }
 
@@ -110,6 +114,7 @@ struct LauncherSettings: Codable, Equatable {
         case "savesDir": savesDir = value
         case "fullscreen": fullscreen = try bool()
         case "lowLatency": lowLatency = try bool()
+        case "refresh120": refresh120 = try bool()
         case "frameStats": frameStats = try bool()
         case "metalHUD": metalHUD = try bool()
         case "mode":

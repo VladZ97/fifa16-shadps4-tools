@@ -7,7 +7,7 @@
 #   FIFA_MODS_DIR   patch/mods overlay, served as /download0 (optional; <mods>/app0 overlays /app0; empty: no mods at all)
 #   FIFA_SAVES_DIR  savegame root (saves land in <root>/<user>/savedata/CUSA02138)
 # Options (set only to change the default): BB_FULLSCREEN=0, BB_PRESENT_MODE=Immediate,
-# BB_FRAME_STATS=1, MTL_HUD_ENABLED=1, KK_FLAGS, SHAD_READBACK_TILED.
+# BB_VBLANK_HZ=120 (120 Hz mode), BB_FRAME_STATS=1, MTL_HUD_ENABLED=1, KK_FLAGS, SHAD_READBACK_TILED.
 #
 #   run.sh play      launch for playing (log reduced to errors)
 #   run.sh start     launch with the full log (diagnostics)
@@ -26,12 +26,42 @@ own_emulators() { ps -axo pid=,command= | grep -F "$EMU" | grep -v grep | awk '{
 own_hosts() { ps -axo pid=,command= | grep -F "$APP/Contents/Helpers/" | grep bbgpu-host | grep -v grep | awk '{print $1}'; }
 stop_own() { local p; p=$(own_emulators); [ -n "$p" ] && kill $p 2>/dev/null; p=$(own_hosts); [ -n "$p" ] && kill $p 2>/dev/null; sleep 1; }
 
+# The caches the game builds while it runs (translated shaders, compiled pipelines, the record of
+# the emulator's start-up patches) live in the savegame folder the user chose, in <saves>/cache,
+# so they stay with the saves when that folder is moved or shared between installs. The
+# emulator and the renderer look in <data>/user/cache, which is a link to it. A cache an older
+# version left in the data folder is moved over once. No savegame folder to write to: a plain
+# local cache folder, as before.
+place_caches() {
+    local link="$USERDIR/cache" dest="$SAVES_DIR/cache" e n
+    if ! mkdir -p "$dest" 2>/dev/null || [ ! -w "$dest" ]; then
+        [ -L "$link" ] && rm -f "$link"
+        mkdir -p "$link"; return 0
+    fi
+    if [ -L "$link" ]; then
+        [ "$(readlink "$link")" = "$dest" ] || { rm -f "$link"; ln -s "$dest" "$link"; }
+        return 0
+    fi
+    if [ -d "$link" ]; then
+        for e in "$link"/*; do
+            [ -e "$e" ] || continue; n=$(basename "$e")
+            rmdir "$dest/$n" 2>/dev/null || true      # an empty folder there does not count
+            [ -e "$dest/$n" ] || mv "$e" "$dest/" 2>/dev/null || true
+        done
+        rm -rf "$link"
+    fi
+    ln -s "$dest" "$link"
+}
+
 game_env() {
     export SHAD_USER_DIR="$USERDIR" SHAD_HOME_DIR="$SAVES_DIR"
     # The renderer library (in the emulator and in the GPU host) resolves its own user folder:
     # BB_GPU_USER_DIR keeps its shader caches and trophy notice here too, not in the shared
     # ~/Library/Application Support/shadPS4 of another shadPS4 install. Captures likewise.
     export BB_GPU_USER_DIR="$USERDIR" BB_CAPTURE_DIR="$DATA/captures"
+    # Nothing made from the game ships with the app: the shader cache and the emulator's record of
+    # its start-up code patches are built on this Mac from the user's own game files (place_caches).
+    unset BB_SHADER_SEED_DIR SHAD_PATCH_SEED_DIR
     [ -n "$UPDATE_DIR" ] && export SHAD_UPDATE_DIR="$UPDATE_DIR"
     if [ -n "$MODS_DIR" ]; then
         export SHAD_DOWNLOAD_DIR="$MODS_DIR"
@@ -46,7 +76,7 @@ game_env() {
     export SHAD_BBGPU="${SHAD_BBGPU:-1}" SHAD_BBGPU_SPLIT="${SHAD_BBGPU_SPLIT:-1}" BB_CONFIG="$RES/bbport.ini" \
            BB_ARENA_LAYOUT="${BB_ARENA_LAYOUT:-runs}" BB_READBACKS="${BB_READBACKS:-2}" \
            SHAD_MAPPING_BASE="${SHAD_MAPPING_BASE:-400000000}" BB_GPU_HOST="${BB_GPU_HOST:-$HOST}" \
-           BB_GPU_WATCHDOG_MS="${BB_GPU_WATCHDOG_MS:-2000}" BB_READBACK_LINEAR="${BB_READBACK_LINEAR:-1}" \
+           BB_GPU_WATCHDOG_MS="${BB_GPU_WATCHDOG_MS:-5000}" BB_READBACK_LINEAR="${BB_READBACK_LINEAR:-1}" BB_RB_DIRECT="${BB_RB_DIRECT:-2}" \
            BB_DRAW_PIPE="${BB_DRAW_PIPE:-0}" BB_IMMEDIATE_FLIPS="${BB_IMMEDIATE_FLIPS:-1}" \
            BB_MIDFRAME_FLUSH_MS="${BB_MIDFRAME_FLUSH_MS:-3}" BB_FULLSCREEN="${BB_FULLSCREEN:-1}"
 }
@@ -69,8 +99,12 @@ case "${1:-play}" in
         mkdir -p "$USERDIR" "$RUNS" "$SAVES_DIR"
         write_config "$1"
         [ -n "$(own_emulators)" ] && stop_own
+        place_caches
         DIR="$RUNS/$(date +%Y%m%d_%H%M%S)"; mkdir -p "$DIR"
         game_env
+        # First launch: the emulator reports how far it is with preparing the game's code here; the
+        # game window shows it as a progress bar and the launcher in its status line.
+        export BB_PROGRESS_FILE="$DIR/progress"
         echo "run dir : $DIR"; echo "game    : $GAME_DIR"; echo "update  : ${UPDATE_DIR:-none}"; echo "mods    : ${MODS_DIR:-none}"; echo "saves   : $SAVES_DIR"
         cd "$DIR" || exit 1
         nohup "$EMU" --game "$GAME_DIR/eboot.bin" > "$DIR/emulator.log" 2>&1 &

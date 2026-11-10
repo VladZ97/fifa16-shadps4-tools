@@ -1,7 +1,7 @@
 #!/bin/zsh
 # Installs the custom-built shadPS4 next to the launcher's versions as "Custom-flipfix" and points ~/fifa_run.sh at it.
 set -e
-SRC="/private/tmp/claude-501/-Volumes-SanDiskSSD-F16-02138-extracted-F16-02138-FIFA-16---CUSA02138---Update-1-07-FIFA-16-CUSA02138/dbbed053-17e5-4d95-b585-d31d29a90051/scratchpad/build/shadps4/build"
+SRC="${FIFA_SCRATCH:?set FIFA_SCRATCH to the build scratch folder}/build/shadps4/build"
 DST="$HOME/Library/Application Support/shadPS4QtLauncher/versions/Custom-flipfix"
 mkdir -p "$DST"
 for f in shadps4 libvulkan.dylib libvulkan_kosmickrisp.dylib kosmickrisp_mesa_icd.json; do cp "$SRC/$f" "$DST/"; done

@@ -31,7 +31,7 @@ FIFA_MODS_DIR=<modsDir or empty> FIFA_SAVES_DIR=<savesDir>
 ```
 
 and, only when an option differs from run.sh's default: `BB_FULLSCREEN=0` (windowed),
-`BB_PRESENT_MODE=Immediate` (low latency), `BB_FRAME_STATS=1`, `MTL_HUD_ENABLED=1`. run.sh
+`BB_PRESENT_MODE=Immediate` (low latency), `BB_VBLANK_HZ=120` (120 Hz mode), `BB_FRAME_STATS=1`, `MTL_HUD_ENABLED=1`. run.sh
 sets every emulator and bridge variable itself; the launcher adds nothing else. run.sh prints
 `run dir : <path>` and writes `<run dir>/pid`; the launcher keeps that pid in `state.json` and
 **Stop** ends only that process (SIGTERM, SIGKILL after 10 s, then any `bbgpu-host*` child).
@@ -46,7 +46,25 @@ screenshot and stats monitor). **Reset Options** restores run.sh's defaults and 
 Required (Play needs all of them): Game folder, Savegame folder (exists or can be created, and
 is writable), the bundled emulator, the bundled GPU host (`bbgpu-host-macos27`), the bundled
 run.sh. Shown but never blocking: Update folder, Mods folder, Emulator config (`user/config.json`,
-created on first Play), Shader cache (file count under `user/cache/CUSA02138`).
+created on first Play), Shader cache (file count under `<savegame folder>/cache/CUSA02138`).
+
+## Caches (0.5.1-i)
+
+Nothing made from the game ships with the app. Two caches are built on the user's Mac from their own
+game files and both live in `<savegame folder>/cache` (run.sh `place_caches` links the emulator's
+`user/cache` there and moves a cache left by an older version):
+
+- `CUSA02138/`: translated shaders and pipelines, filled while playing. The game shows a small
+  "Building shaders" note while it compiles.
+- `static_patches/`: the record of the code preparation done at the first start. While it is built
+  (about 8 s) the game window shows a progress bar and the launcher's status line shows
+  "First launch: preparing the game N%" (run.sh exports `BB_PROGRESS_FILE=<run dir>/progress`,
+  content `prepare <0..1000>`; `LaunchProgress.read`).
+
+The Savegame folder row shows the size ("Cache: 27 MB" or "Cache: empty") and a **Clear Cache…**
+button with a confirmation. It removes the entries inside `<savegame folder>/cache` (and inside an
+old unlinked `user/cache`), never the savegames, and is disabled while a game runs or the cache is
+empty (`CacheStore` in Model/Status.swift). The next start prepares the game again.
 
 ## Where things are
 
@@ -61,9 +79,9 @@ F16.app/Contents/Helpers/FIFA 16 GPU.app             the GPU host app (bbgpu-hos
 
 ~/Library/Application Support/FIFA 16/                   data folder (everything writable)
   settings.json   the four folders and the options     state.json   pid of the game the launcher started
-  user/           the emulator's user folder (config.json, cache/, log/)
+  user/           the emulator's user folder (config.json, log/; cache -> <savegame folder>/cache)
   runs/<timestamp>/emulator.log                          one folder per launch
-  saves/          default savegame folder
+  saves/          default savegame folder (savegames and cache/)
 ```
 
 ## Command line
@@ -72,7 +90,7 @@ F16.app/Contents/Helpers/FIFA 16 GPU.app             the GPU host app (bbgpu-hos
 "F16.app/Contents/MacOS/F16" --cli status             the checklist and the game's state
 "F16.app/Contents/MacOS/F16" --cli env                the command and the variables Play adds
 "F16.app/Contents/MacOS/F16" --cli set gameDir /path  settings from Terminal (keys: gameDir,
-                                      updateDir, modsDir, savesDir, fullscreen, lowLatency, frameStats, metalHUD, mode)
+                                      updateDir, modsDir, savesDir, fullscreen, lowLatency, refresh120, frameStats, metalHUD, mode)
 "F16.app/Contents/MacOS/F16" --cli play [--force]     refuses while another shadps4 runs unless forced
 "F16.app/Contents/MacOS/F16" --cli stop
 ```

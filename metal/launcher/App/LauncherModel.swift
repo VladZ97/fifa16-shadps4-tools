@@ -24,6 +24,11 @@ final class LauncherModel: ObservableObject {
     @Published private(set) var others: [EmulatorProcess] = []
     @Published private(set) var logText = ""
     @Published private(set) var logURL: URL?
+    /// What the cache in the savegame folder holds (the Clear Cache button).
+    @Published private(set) var cacheUsage = CacheStore.Usage()
+    @Published var confirmClearCache = false
+    /// First launch only: how far the emulator is with preparing the game's code (0..<1000).
+    @Published private(set) var preparing: Int?
     @Published private(set) var scriptOutput = ""
     @Published var message: String?
     @Published var page = Page.game
@@ -75,6 +80,34 @@ final class LauncherModel: ObservableObject {
 
     func refreshStatus() {
         status = InstallStatus.check(paths, settings: settings)
+        refreshCacheUsage()
+    }
+
+    /// Counts the cache off the main thread (it can sit on an external drive).
+    func refreshCacheUsage() {
+        let folders = self.folders, paths = self.paths
+        Task.detached(priority: .utility) {
+            let usage = CacheStore.usage(folders: folders, paths: paths)
+            await MainActor.run { if usage != self.cacheUsage { self.cacheUsage = usage } }
+        }
+    }
+    /// The size shown beside Clear Cache.
+    var cacheSizeLabel: String { cacheUsage.files == 0 ? "Cache: empty" : "Cache: \(cacheUsage.megabytes)" }
+
+    /// Clear Cache: possible while no game runs and there is something to remove.
+    var canClearCache: Bool { phase == .idle && others.isEmpty && cacheUsage.files > 0 }
+    var clearCacheHelp: String {
+        if phase != .idle || !others.isEmpty { return "Stop the game first." }
+        if cacheUsage.files == 0 { return "The cache is empty." }
+        return "Removes the shader cache and the prepared game code (\(cacheUsage.files) files, \(cacheUsage.megabytes)). Savegames are not touched."
+    }
+    func clearCache() {
+        guard canClearCache else { return }
+        let removed = CacheStore.clear(folders: folders, paths: paths)
+        cacheUsage = CacheStore.usage(folders: folders, paths: paths)
+        message = cacheUsage.files == 0
+            ? "Cache cleared: \(removed.files) files, \(removed.megabytes). The next launch prepares the game again."
+            : "Some cache files could not be removed (\(cacheUsage.files) left)."
     }
 
     /// Process list and log tail, off the main thread.
@@ -82,7 +115,7 @@ final class LauncherModel: ObservableObject {
         guard !refreshing else { return }
         refreshing = true
         tick += 1
-        if tick % 10 == 0 { refreshStatus() }
+        if tick % 10 == 0 { refreshStatus() } else if tick % 3 == 0 { refreshCacheUsage() }
         let paths = self.paths
         let game = self.game
         Task.detached(priority: .utility) {
@@ -91,15 +124,19 @@ final class LauncherModel: ObservableObject {
             let dir = game.map { URL(fileURLWithPath: $0.runDir) } ?? paths.latestRun()
             let log = dir?.appendingPathComponent("emulator.log")
             let text = log.map { LogTail.read($0) } ?? ""
+            let preparing = alive ? dir.flatMap { LaunchProgress.read($0.appendingPathComponent("progress")) } : nil
             await MainActor.run {
                 self.refreshing = false
-                self.apply(emulators: emulators, gameAlive: alive, log: log, text: text)
+                if preparing != self.preparing { self.preparing = preparing }
+                self.apply(emulators: emulators, checked: game, gameAlive: alive, log: log, text: text)
             }
         }
     }
 
-    private func apply(emulators: [EmulatorProcess], gameAlive: Bool, log: URL?, text: String) {
-        if let game, phase == .running, !gameAlive, self.game == game {
+    /// `checked` is the game this refresh looked at when it began: a refresh that was under way
+    /// while Play started the game knows nothing about the new one and must not report it gone.
+    private func apply(emulators: [EmulatorProcess], checked: LaunchState?, gameAlive: Bool, log: URL?, text: String) {
+        if let game, phase == .running, !gameAlive, checked == game {
             self.game = nil
             phase = .idle
             message = "The game exited."
@@ -204,7 +241,7 @@ final class LauncherModel: ObservableObject {
             case .game: return "The dumped CUSA02138 folder: eboot.bin and sce_sys/ inside. Required."
             case .update: return "The dumped update 1.07 (CUSA02138-UPDATE). Optional: without it the 1.00 game runs."
             case .mods: return "Where your mods are kept: any folder, an external drive too. Optional: by default they stay in the app's data folder."
-            case .saves: return "Where savegames are kept. Default: the app's data folder."
+            case .saves: return "Where savegames and the shader cache the game builds while you play are kept. Default: the app's data folder."
             }
         }
         var clearable: Bool { self == .update || self == .mods }
@@ -270,8 +307,12 @@ final class LauncherModel: ObservableObject {
     }
     func openMods() { if let dir = mods.folderToOpen { NSWorkspace.shared.open(dir) } }
     func openShaderCache() {
-        try? FileManager.default.createDirectory(at: paths.shaderCache, withIntermediateDirectories: true)
-        NSWorkspace.shared.open(paths.shaderCache)
+        // In the savegame folder; a cache of an older version still in the data folder is shown where it is
+        // (the next Play moves it).
+        let fm = FileManager.default
+        let dir = !fm.fileExists(atPath: folders.shaderCache.path) && fm.fileExists(atPath: paths.shaderCache.path) ? paths.shaderCache : folders.shaderCache
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(dir)
     }
     func revealLog() { if let logURL { NSWorkspace.shared.activateFileViewerSelecting([logURL]) } }
     func openSettingsFile() {
@@ -281,10 +322,10 @@ final class LauncherModel: ObservableObject {
     /// Options back to run.sh's defaults; the folders stay.
     func resetOptions() {
         var s = settings
-        s.fullscreen = true; s.lowLatency = false; s.frameStats = false; s.metalHUD = false; s.mode = .play
+        s.fullscreen = true; s.lowLatency = false; s.refresh120 = false; s.frameStats = false; s.metalHUD = false; s.mode = .play
         settings = s
     }
     var optionsAreDefault: Bool {
-        settings.fullscreen && !settings.lowLatency && !settings.frameStats && !settings.metalHUD && settings.mode == .play
+        settings.fullscreen && !settings.lowLatency && !settings.refresh120 && !settings.frameStats && !settings.metalHUD && settings.mode == .play
     }
 }
