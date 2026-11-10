@@ -27,7 +27,17 @@ FSR Vulkan port         Copyright (c) Q2RTX FSR Vulkan contributors             
 AMD GCN register headers Copyright (c) 2014-2021 Advanced Micro Devices, Inc.   MIT
 LibAtrac9               Copyright (c) 2018 Alex Barney                          MIT
 DejaVu Sans             Copyright (c) 2003 Bitstream, Inc.; DejaVu changes public domain   Bitstream Vera licence
+FXAA 3.11 (ported shader) Copyright (c) 2014-2015 NVIDIA CORPORATION           BSD-3-Clause
+FreeType                Portions of this software are copyright (c) The FreeType Project (www.freetype.org). All rights reserved.   FTL
 
-The notices of the statically linked libraries (fmt, xxHash, miniz, robin-map, magic_enum, sirit,
-Dear ImGui, half, FSR, AMD headers, LibAtrac9, DejaVu) are reproduced from the licence files in the
-fifa16_mac_port tree (gpu/third_party, deps/src); years and holders as stated there.
+Further libraries are compiled or statically linked into the emulator and the renderer, each under
+a permissive licence (MIT, BSD, Boost, zlib, libpng, Apache-2.0) or the LGPL: Abseil, Boost, CLI11,
+cpp-httplib, date, Discord RPC, RapidJSON, dr_flac, epoll-shim, hwinfo, ImGuiFileDialog, JSON for
+Modern C++, libpng, libusb (LGPL-2.1-or-later), minimp3, MiniUPnPc, OpenAL Soft (LGPL-2.0-or-later),
+Protocol Buffers, pugixml, RenderDoc API header, SPIRV-Headers, spdlog, stb, toml11, Tracy,
+Vulkan-Headers, Vulkan Memory Allocator, Xbyak, ZArchive, zlib-ng, Zstandard, Zydis, Zycore.
+
+The copyright notices and licence texts of every library named in this file that is compiled or
+statically linked into the binaries are reproduced in Licenses/THIRD-PARTY-LICENSES.txt, from the
+licence files of the source trees named in SOURCES.txt. The emulator is built without the FDK AAC
+and LibreSSL libraries of upstream shadPS4, whose licences are not GPL-compatible.

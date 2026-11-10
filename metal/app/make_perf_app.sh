@@ -28,6 +28,12 @@ HM="$APP/Contents/Helpers/F16 GPU.app/Contents/MacOS"; EMU="$RES/emulator"
 cp "$B/out/bbgpu-host" "$B/out/bbgpu-host-macos26" "$B/out/bbgpu-host-macos27" "$B/out/gpu-arm64/libbbgpu.dylib" "$B/out/gpu-arm64/libbbhost.dylib" "$HM/"
 cp "$B/out/gpu/libbbgpu.dylib" "$EMU/libbbgpu.dylib"     # the in-process fallback (x86-64)
 cp "$HOME/fifa_metal/app/run.sh" "$RES/run.sh"; chmod +x "$RES/run.sh"
+# Notices and licence texts come from app/NOTICE and app/licenses, not from the base bundle: the v0.5.0 texts lack
+# THIRD-PARTY-LICENSES.txt (the notices of the libraries linked into the emulator and the renderer, written by
+# make_third_party_licenses.py).
+cp "$HOME/fifa_metal/app/NOTICE" "$RES/NOTICE"
+rm -rf "$RES/Licenses"; cp -R "$HOME/fifa_metal/app/licenses" "$RES/Licenses"
+[ -s "$RES/Licenses/THIRD-PARTY-LICENSES.txt" ] || { echo "Licenses/THIRD-PARTY-LICENSES.txt is missing: run make_third_party_licenses.py"; exit 1; }
 # 0.5.1-i: nothing made from the game is bundled. The shader cache and the start-up patch record are built on the
 # user's Mac from their own game files and kept in their savegame folder (run.sh place_caches). 0.5.1 to 0.5.1-h
 # carried Resources/shader_seed (the game's shaders, translated) and, from -g, Resources/patch_seed.
@@ -91,7 +97,12 @@ dirty=$(find "$APP" -type f \( -name "*.spv" -o -name "*.metal" -o -name "*.bina
     -o -name "*.at9" -o -name "*.sbk" -o -name "*.db" -o -name "keys.json" \) | head -5)
 [ -z "$dirty" ] || { echo "game-derived or game files in the bundle:"; echo "$dirty"; exit 1; }
 if grep -rIl "/Users/" "$APP" 2>/dev/null | head -3 | grep -q .; then echo "build-machine path in a bundle text file:"; grep -rIl "/Users/" "$APP" | head -3; exit 1; fi
-echo "bundle check: no caches, no game files"
+# The FDK AAC licence and the OpenSSL/SSLeay licences in LibreSSL are not GPL-compatible: the emulator must be built
+# without them (ENABLE_GPL_INCOMPATIBLE_LIBS=OFF, the default of the fork).
+if nm "$EMU/shadps4" 2>/dev/null | grep -qE " _(aacDecoder_Open|SSL_CTX_new|EVP_CipherInit_ex)$"; then
+    echo "bundle check FAILED: the emulator links FDK AAC or LibreSSL"; exit 1
+fi
+echo "bundle check: no caches, no game files, no GPL-incompatible libraries"
 # 0.5.1-i: the binaries carry the build machine's home folder in assert messages and debug symbols; replaced by a
 # neutral path of the same length before signing (scrub_build_paths.py), and the packaging stops if any is left.
 python3 "$(dirname "$0")/scrub_build_paths.py" "$APP" || exit 1

@@ -1592,3 +1592,24 @@ rebuilt from shadps4-metal (9 files uncommitted). Earlier bundles untouched. Not
   were removed from the renderer, emulator and mods repositories (none was ever pushed). Four old scripts in
   home/ take their scratch folder from FIFA_SCRATCH.
 - To publish: push each branch and the tag v0.5.1 by name to the fork remotes, then upload F16-macOS-0.5.1.zip.
+
+## 2026-11-10 — v0.5.1 licence audit before publishing (release re-cut)
+
+Audit of the bundle and the four repositories before the first push of v0.5.1. Three things were wrong and are fixed:
+
+- The emulator linked Fraunhofer FDK AAC and LibreSSL statically. The FDK AAC licence and the OpenSSL/SSLeay
+  licences are not GPL-compatible, so a redistributed GPL binary must not contain them. The fork has a new CMake
+  option `ENABLE_GPL_INCOMPATIBLE_LIBS` (default OFF): an AAC decoder instance is refused (FIFA 16 never creates
+  one), libSceHttp HTTPS uses upstream's mock path, the P2P packet crypto uses CommonCrypto (checked against
+  `openssl enc -aes-128-cfb` and HMAC-SHA1 reference output). `make_perf_app.sh` refuses an emulator that still
+  has `aacDecoder_Open`, `SSL_CTX_new` or `EVP_CipherInit_ex`.
+- The edge anti-aliasing shader is a port of NVIDIA FXAA 3.11 (BSD-3-Clause), not public domain as a comment said:
+  the notice is in the renderer at `gpu/third_party/fxaa/LICENSE.txt` and in the bundle.
+- The notices of the libraries statically linked into the emulator and the renderer were not in the bundle.
+  `app/make_third_party_licenses.py <emulator checkout> <renderer checkout>` writes
+  `app/licenses/THIRD-PARTY-LICENSES.txt` (48 libraries); the packaging now takes NOTICE and Licenses from
+  `app/` instead of inheriting the v0.5.0 texts.
+
+Validation of the re-cut candidate (packaged app, full-screen match): MATCH_OK, 17 windows, 60.0 fps, mean p99
+19.6 ms, max 34.2 ms, 0 hitches. The tag v0.5.1 was moved to the new commits before anything was pushed.
+The published v0.5.0 asset still has the old linkage and the shorter notices.
